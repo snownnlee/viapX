@@ -24,6 +24,7 @@ import {
 import { buildEmptyTargetWarning, buildRestoreConfirm } from '../utils/restoreMode';
 import { useRestoreMode } from '../hooks/useRestoreMode';
 import { findMigratedParent, type MigratedParent } from '../utils/migratedParent';
+import { appBatchCaps, appBatchKey, type BatchMode } from '../utils/appBatch';
 import {
   buildBatchConfirmMessage, getAvailableSpaceForPath, type BatchReportItem,
 } from '../utils/batchMigration';
@@ -265,8 +266,10 @@ export default function AppMigration({ visible }: { visible: boolean }) {
   // 还原状态
   const [restoringKey, setRestoringKey] = useState<string | null>(null);
   const [restoreProgressMap, setRestoreProgressMap] = useState<Record<string, number>>({});
-  // 批量迁移
+  // 批量操作：模式由第一个被勾选的应用决定（可迁移 → 迁移；可还原 → 还原）
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const [batchMode, setBatchMode] = useState<BatchMode | null>(null);
+  const [batchRunningMode, setBatchRunningMode] = useState<BatchMode>('migrate');
   const [batchMigrating, setBatchMigrating] = useState(false);
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 });
   // 批量结果清单：只要出现失败或跳过就用它替代 toast 汇总
@@ -1545,18 +1548,42 @@ export default function AppMigration({ visible }: { visible: boolean }) {
     handleCloseMigrationModal();
   }
 
-  // 批量选择处理
-  function handleToggleSelect(app: InstalledApp) {
-    const key = app.registry_path || app.install_location;
-    setSelectedKeys((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) {
-        next.delete(key);
-      } else {
-        next.add(key);
-      }
-      return next;
+  /** 单个应用在批量操作里的能力：决定复选框是否可点 */
+  function capsOf(app: InstalledApp) {
+    return appBatchCaps({
+      installLocation: app.install_location,
+      isMigrated: migratedPaths.some(p => p.toLowerCase() === app.install_location.toLowerCase()),
+      keptRestoreTarget: keptRestoreTargets[app.install_location.toLowerCase()],
+      migratedParents,
+      isViap: isViapSelf(app),
     });
+  }
+
+  // 批量选择处理：第一个勾选决定模式，之后只能勾选同类
+  function handleToggleSelect(app: InstalledApp) {
+    const key = appBatchKey(app);
+    const caps = capsOf(app);
+
+    if (selectedKeys.has(key)) {
+      const next = new Set(selectedKeys);
+      next.delete(key);
+      setSelectedKeys(next);
+      if (next.size === 0) setBatchMode(null);
+      return;
+    }
+
+    if (!batchMode) {
+      // 两者皆可时优先"迁移"，与行内按钮的排列顺序一致
+      const mode: BatchMode | null = caps.canMigrate ? 'migrate' : caps.canRestore ? 'restore' : null;
+      if (!mode) return;
+      setBatchMode(mode);
+      setSelectedKeys(new Set([key]));
+      return;
+    }
+
+    const allowed = batchMode === 'migrate' ? caps.canMigrate : caps.canRestore;
+    if (!allowed) return;
+    setSelectedKeys(new Set([...selectedKeys, key]));
   }
 
   // 停止批量迁移：设置取消标志并通知后端停止当前任务
@@ -1567,19 +1594,22 @@ export default function AppMigration({ visible }: { visible: boolean }) {
     // 列表刷新在 handleBatchMigrate 的 finally 段（handleRefresh）中处理，这里不额外刷新避免竞态
   }
 
-  function handleSelectAll() {
-    const selectable = apps.filter((a) =>
-      !migratedPaths.some(
-        (p) => p.toLowerCase() === a.install_location.toLowerCase()
-      ) && !isViapSelf(a) // Viap 自身不可迁移，排除在批量操作之外
-      && !findMigratedParent(a.install_location, migratedParents) // 随父目录迁移的不能单独迁移
-    );
-    setSelectedKeys((prev) => {
-      if (prev.size === selectable.length) {
-        return new Set();
-      }
-      return new Set(selectable.map((a) => a.registry_path || a.install_location));
+  function handleSelectAll(modeOverride?: BatchMode) {
+    // 未选任何应用时工具栏同时给出"全选可迁移/全选可还原"，由点击的那个决定模式
+    const mode: BatchMode = modeOverride ?? batchMode ?? 'migrate';
+    const selectable = apps.filter((app) => {
+      const caps = capsOf(app);
+      return mode === 'migrate' ? caps.canMigrate : caps.canRestore;
     });
+    const allSelected = selectable.length > 0 && selectable.every(app => selectedKeys.has(appBatchKey(app)));
+    if (allSelected) {
+      setSelectedKeys(new Set());
+      setBatchMode(null);
+      return;
+    }
+    if (selectable.length === 0) return;
+    setBatchMode(mode);
+    setSelectedKeys(new Set(selectable.map(appBatchKey)));
   }
 
   // 批量迁移：依次迁移每个选中的应用，复用单个迁移的进度弹窗
@@ -1624,9 +1654,11 @@ export default function AppMigration({ visible }: { visible: boolean }) {
 
     // 初始化批量状态
     setBatchMigrating(true);
+    setBatchRunningMode('migrate');
     batchCancelledRef.current = false;
     setBatchProgress({ current: 0, total: selectedApps.length });
     setSelectedKeys(new Set());
+    setBatchMode(null);
 
     // 打开进度弹窗（复用单个迁移的 MigrationModal）
     setMigrationModalOpen(true);
@@ -1841,6 +1873,128 @@ export default function AppMigration({ visible }: { visible: boolean }) {
     await handleRefresh();
   }
 
+  /** 取某个应用可用的还原记录：优先活跃记录，其次保留副本 */
+  function restoreRecordOf(app: InstalledApp) {
+    const path = app.install_location.toLowerCase();
+    return appMigrationRecords.find(r => r.status === 'active' && r.original_path.toLowerCase() === path)
+      ?? appMigrationRecords.find(r => r.status !== 'active' && r.target_kept && r.original_path.toLowerCase() === path);
+  }
+
+  // 批量还原：依次还原每个选中的应用，失败/跳过只记录不中断
+  async function handleBatchRestore() {
+    if (selectedKeys.size === 0) return;
+
+    const selectedApps = apps.filter(app => selectedKeys.has(appBatchKey(app)) && capsOf(app).canRestore);
+    if (selectedApps.length === 0) return;
+
+    const copy = buildRestoreConfirm(restoreMode, `${selectedApps.length} 个应用`, '还原');
+    const confirmed = await confirm(
+      `${copy.message}\n\n批量过程不会逐个弹窗：目标为空或原路径冲突的应用会被跳过并列入结果清单。`,
+      { title: '确认批量还原', kind: 'warning', okLabel: copy.okLabel, cancelLabel: '取消' },
+    );
+    if (!confirmed) return;
+
+    setBatchMigrating(true);
+    setBatchRunningMode('restore');
+    batchCancelledRef.current = false;
+    setBatchProgress({ current: 0, total: selectedApps.length });
+    setSelectedKeys(new Set());
+    setBatchMode(null);
+
+    setMigrationModalOpen(true);
+    setMigrationStep('copying');
+    setMigrationMessage('准备开始批量还原...');
+    setMigrationProgress(0);
+    setLockedProcesses([]);
+
+    const results: BatchReportItem[] = [];
+    let unlisten: UnlistenFn | null = null;
+    let currentTaskPath = '';
+    let currentRowKey = '';
+
+    try {
+      unlisten = await listen<MigrationProgressEvent>('migration-progress', (event) => {
+        const data = event.payload;
+        if (currentTaskPath && data.task_id.toLowerCase() === currentTaskPath) {
+          setRestoreProgressMap(prev => ({ ...prev, [currentRowKey]: data.percent }));
+          setMigrationMessage(data.message || '正在还原...');
+        }
+      });
+    } catch (error) {
+      logger.error('注册批量还原进度监听失败:', error);
+    }
+
+    try {
+      for (let index = 0; index < selectedApps.length; index++) {
+        if (batchCancelledRef.current) break;
+        const app = selectedApps[index];
+        setBatchProgress({ current: index + 1, total: selectedApps.length });
+        setMigratingApp(app);
+
+        const record = restoreRecordOf(app);
+        if (!record) {
+          results.push({ name: app.display_name, status: 'failed', reason: '未找到迁移记录' });
+          continue;
+        }
+
+        const rowKey = `${app.display_name}|${app.registry_path}`;
+        currentTaskPath = record.original_path.toLowerCase();
+        currentRowKey = rowKey;
+        setRestoringKey(rowKey);
+        setRestoreProgressMap(prev => ({ ...prev, [rowKey]: 0 }));
+        setMigrationMessage(`正在还原「${app.display_name}」...`);
+
+        try {
+          const result = await invoke<MigrationResult>('restore_app', { historyId: record.id });
+          if (result.success) {
+            results.push({ name: app.display_name, status: 'success' });
+          } else if (parseTargetEmptyConfirm(result.message)) {
+            // 批量里不逐个弹"目标为空"确认，按跳过处理
+            results.push({
+              name: app.display_name,
+              status: 'skipped',
+              reason: '目标目录为空，已跳过（单独还原时可选择继续）',
+            });
+          } else if (result.message.includes('另一个恢复任务')) {
+            results.push({ name: app.display_name, status: 'skipped', reason: '有其它恢复任务在进行' });
+          } else {
+            results.push({
+              name: app.display_name,
+              status: 'failed',
+              reason: formatMigrationFailureMessage(result.message),
+            });
+          }
+        } catch (error) {
+          results.push({ name: app.display_name, status: 'failed', reason: `${error}` });
+        } finally {
+          setRestoreProgressMap(prev => {
+            const next = { ...prev };
+            delete next[rowKey];
+            return next;
+          });
+          setRestoringKey(null);
+        }
+
+        setMigrationProgress(Math.round(((index + 1) / selectedApps.length) * 100));
+      }
+    } finally {
+      if (unlisten) unlisten();
+      handleCloseMigrationModal();
+    }
+
+    const successCount = results.filter(item => item.status === 'success').length;
+    if (results.length === 0) {
+      showToast('批量还原已停止，没有开始任何项目', 'info');
+    } else if (successCount === results.length) {
+      showToast(`批量还原完成：${successCount} 个全部成功`, 'success');
+    } else {
+      setBatchReport({ items: results, cancelled: batchCancelledRef.current });
+      setBatchReportVisible(true);
+    }
+
+    await handleRefresh();
+  }
+
   useEffect(() => {
     // 仅在页面可见时触发：已有缓存 → 恢复本地状态；无缓存 → 开始流式扫描
     if (!visible) return;
@@ -1961,6 +2115,9 @@ export default function AppMigration({ visible }: { visible: boolean }) {
             onToggleSelect={handleToggleSelect}
             onSelectAll={handleSelectAll}
             onBatchMigrate={handleBatchMigrate}
+            onBatchRestore={handleBatchRestore}
+            batchMode={batchMode}
+            batchRunningMode={batchRunningMode}
             onStopBatchMigrate={handleStopBatchMigrate}
             batchMigrating={batchMigrating}
             batchProgress={batchProgress}
@@ -2007,7 +2164,7 @@ export default function AppMigration({ visible }: { visible: boolean }) {
       <BatchMigrationReport
         isOpen={batchReportVisible}
         onClose={() => setBatchReportVisible(false)}
-        title="应用迁移"
+        title={batchRunningMode === 'restore' ? '应用还原' : '应用迁移'}
         items={batchReport.items}
         cancelled={batchReport.cancelled}
       />

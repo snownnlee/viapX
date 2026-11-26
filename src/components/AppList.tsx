@@ -1,7 +1,7 @@
 // 应用列表组件 — 桌面工具风格
 // 表格化行布局，紧凑信息密度，弱化操作按钮视觉
 
-import { Package, Search, X, Link2, Check, ArrowRightLeft, FolderOpen, RotateCw, LoaderCircle, ArrowUpDown, ArrowUp, ArrowDown, ShieldCheck, ShieldOff } from 'lucide-react';
+import { Package, Search, X, Link2, Check, ArrowRightLeft, FolderOpen, RotateCw, RotateCcw, LoaderCircle, ArrowUpDown, ArrowUp, ArrowDown, ShieldCheck, ShieldOff } from 'lucide-react';
 import { InstalledApp } from '../types';
 import { useState, useMemo, useDeferredValue, memo, useEffect, useCallback } from 'react';
 import FilterSelect from './FilterSelect';
@@ -11,6 +11,7 @@ import { useDangerousPathCheck } from '../hooks/useDangerousPathCheck';
 import { useRestoreMode } from '../hooks/useRestoreMode';
 import { restoreActionHint, restoreActionLabel } from '../utils/restoreMode';
 import { findMigratedParent, type MigratedParent } from '../utils/migratedParent';
+import { appBatchCaps, type BatchMode } from '../utils/appBatch';
 
 type MigrationFilter = 'all' | 'migrated' | 'not_migrated';
 type DriveFilter = 'all' | 'c' | 'other';
@@ -42,8 +43,14 @@ interface AppListProps {
   onOpenMigratedParent?: (parent: MigratedParent) => void;
   selectedKeys?: Set<string>;
   onToggleSelect?: (app: InstalledApp) => void;
-  onSelectAll?: () => void;
+  /** 全选：未选择时可指定按迁移/还原全选 */
+  onSelectAll?: (mode?: BatchMode) => void;
   onBatchMigrate?: () => void;
+  onBatchRestore?: () => void;
+  /** 已确定的批量模式；null 表示尚未勾选（由第一个勾选决定） */
+  batchMode?: BatchMode | null;
+  /** 正在运行的批量模式，用于停止按钮与结果标题 */
+  batchRunningMode?: BatchMode;
   onStopBatchMigrate?: () => void;
   batchMigrating?: boolean;
   batchProgress?: { current: number; total: number };
@@ -134,6 +141,7 @@ const AppRow = memo(function AppRow({
   isSelected, onToggleSelect, showCheckbox,
   appSize, isViap, iconsLoading, operationsLocked, keptRestoreTarget,
   parentMigration, onOpenMigratedParent,
+  showSelectionColumn, checkboxDisabled, checkboxHint,
 }: {
   app: InstalledApp;
   onMigrate: (app: InstalledApp) => void;
@@ -151,7 +159,15 @@ const AppRow = memo(function AppRow({
   restoreProgress?: number;
   isSelected?: boolean;
   onToggleSelect?: (app: InstalledApp) => void;
+  /** 该行是否有复选框（可迁移或可还原） */
   showCheckbox?: boolean;
+  /** 当前批量模式下该行不可选：显示但置灰 */
+  checkboxDisabled?: boolean;
+  /** 置灰原因，作为悬停说明 */
+  checkboxHint?: string;
+  /** 列表是否处于可选状态，用于给无能力的行占位对齐 */
+  showSelectionColumn?: boolean;
+  batchMode?: BatchMode;
   appSize?: number;
   isViap?: boolean;
   iconsLoading?: boolean;
@@ -168,9 +184,9 @@ const AppRow = memo(function AppRow({
   } as React.CSSProperties;
 
   // 整行当作复选框的 label：点击行内空白处即切换选中。
-  // 已迁移 / Viap 自身 / 操作锁定这三种情况下本来就不该被勾选，统一在这里判定，
+  // 是否显示由"可迁移或可还原"决定，是否可点由当前批量模式决定（另一类置灰禁用），
   // 行点击与复选框按钮共用同一个开关，避免两处条件写歪。
-  const selectable = !!showCheckbox && !isMigrated && !isViap && !operationsLocked;
+  const selectable = !!showCheckbox && !checkboxDisabled && !operationsLocked;
 
   return (
     <div
@@ -185,16 +201,17 @@ const AppRow = memo(function AppRow({
         if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'transparent';
       }}
     >
-      {/* checkbox */}
-      {showCheckbox && !isMigrated && !isViap && !parentMigration && (
+      {/* checkbox：可迁移或可还原的应用始终有框；当前模式不允许时置灰禁用 */}
+      {showCheckbox ? (
         <button
           onClick={(e) => { e.stopPropagation(); onToggleSelect?.(app); }}
-          disabled={operationsLocked}
+          disabled={operationsLocked || checkboxDisabled}
+          title={checkboxDisabled ? checkboxHint : undefined}
           className={`flex-shrink-0 w-4 h-4 rounded-full border flex items-center justify-center ${
             isSelected
               ? ''
               : 'border-[var(--border-color-strong)] opacity-60 hover:opacity-100'
-          }`}
+          } ${checkboxDisabled ? 'cursor-not-allowed opacity-30 hover:opacity-30' : ''}`}
           style={isSelected ? {
             background: 'var(--color-primary)',
             borderColor: 'var(--color-primary)',
@@ -202,8 +219,9 @@ const AppRow = memo(function AppRow({
         >
           {isSelected && <Check className="w-3 h-3 text-white" strokeWidth={3} />}
         </button>
-      )}
-      {(showCheckbox && (isMigrated || isViap || parentMigration)) && <div className="flex-shrink-0 w-4 h-4" />}
+      ) : showSelectionColumn ? (
+        <div className="flex-shrink-0 w-4 h-4" />
+      ) : null}
 
       {/* left bar for migrated（含随父目录迁移） */}
       {(isMigrated || parentMigration) && (
@@ -374,7 +392,8 @@ export default function AppList({
   migratedParents = [],
   onOpenMigratedParent,
   restoreProgressMap = {},
-  selectedKeys, onToggleSelect, onSelectAll, onBatchMigrate,
+  selectedKeys, onToggleSelect, onSelectAll, onBatchMigrate, onBatchRestore,
+  batchMode = null,
   onStopBatchMigrate,
   batchMigrating = false, batchProgress,
   sizesLoading = false,
@@ -434,6 +453,18 @@ export default function AppList({
     (app: InstalledApp) => findMigratedParent(app.install_location, migratedParents),
     [migratedParents],
   );
+
+  // 批量能力：决定复选框是否显示、当前模式下是否可勾选
+  const capsOf = useCallback((app: InstalledApp) => appBatchCaps({
+    installLocation: app.install_location,
+    isMigrated: migratedPathSet.has(app.install_location.toLowerCase()),
+    keptRestoreTarget: keptRestoreTargets[app.install_location.toLowerCase()],
+    migratedParents,
+    isViap: isViapSelfApp(app),
+  }), [migratedPathSet, keptRestoreTargets, migratedParents, viapInstallPath]);
+
+  // 未勾选任何应用时默认按"迁移"呈现工具栏
+  const currentBatchMode: BatchMode = batchMode ?? 'migrate';
 
   const isViapSelfApp = (app: InstalledApp): boolean =>
     viapInstallPath
@@ -526,8 +557,11 @@ export default function AppList({
   ];
 
   const selectableCount = useMemo(
-    () => filteredApps.filter(a => !isAppMigrated(a) && !isViapSelfApp(a) && !parentOf(a)).length,
-    [filteredApps, migratedPathSet, viapInstallPath, parentOf],
+    () => filteredApps.filter((app) => {
+      const caps = capsOf(app);
+      return currentBatchMode === 'migrate' ? caps.canMigrate : caps.canRestore;
+    }).length,
+    [filteredApps, capsOf, currentBatchMode],
   );
 
   const driveOptions: { value: DriveFilter; label: string }[] = [
@@ -659,13 +693,33 @@ export default function AppList({
           )}
         </span>
 
-        {onToggleSelect && onSelectAll && onBatchMigrate && (
+        {onToggleSelect && onSelectAll && (onBatchMigrate || onBatchRestore) && (
           <div className="flex items-center gap-2 ml-auto">
-            <button onClick={onSelectAll} disabled={operationsLocked} className="text-[11px] btn-link">
-              {selectableCount > 0 && selectedKeys && selectedKeys.size === selectableCount
-                ? '取消全选'
-                : '全选未迁移'}
-            </button>
+            {/* 未做选择时两种全选都给出来，选了以后按模式自动收敛成一个 */}
+            {batchMode === null ? (
+              <>
+                <button
+                  onClick={() => onSelectAll('migrate')}
+                  disabled={operationsLocked}
+                  className="text-[11px] btn-link"
+                >
+                  全选可迁移
+                </button>
+                <button
+                  onClick={() => onSelectAll('restore')}
+                  disabled={operationsLocked}
+                  className="text-[11px] btn-link"
+                >
+                  全选可还原
+                </button>
+              </>
+            ) : (
+              <button onClick={() => onSelectAll()} disabled={operationsLocked} className="text-[11px] btn-link">
+                {selectableCount > 0 && selectedKeys && selectedKeys.size >= selectableCount
+                  ? '取消全选'
+                  : (currentBatchMode === 'restore' ? '全选可还原' : '全选可迁移')}
+              </button>
+            )}
             {batchMigrating ? (
               <button
                 onClick={onStopBatchMigrate}
@@ -675,6 +729,16 @@ export default function AppList({
                 {batchProgress
                   ? `停止 (${batchProgress.current}/${batchProgress.total})`
                   : '停止'}
+              </button>
+            ) : currentBatchMode === 'restore' ? (
+              <button
+                onClick={onBatchRestore}
+                disabled={operationsLocked || !selectedKeys || selectedKeys.size === 0}
+                className="btn btn-primary h-7 text-[11px]"
+                style={{ visibility: selectedKeys && selectedKeys.size > 0 ? 'visible' : 'hidden' }}
+              >
+                <RotateCcw className="w-3 h-3" />
+                批量还原 ({selectedKeys?.size ?? 0})
               </button>
             ) : (
               <button
@@ -769,11 +833,26 @@ export default function AppList({
                 const isViapSelf = isViapSelfApp(app);
                 // 流式扫描完成前图标尚未全部加载
                 const iconsLoading = !!scanPhase && scanPhase !== 'done' && scanPhase !== 'idle';
+                // 复选框始终出现在"可迁移或可还原"的应用前；模式确定后另一类置灰
+                const batchCaps = capsOf(app);
+                const selectableForMode = batchMode
+                  ? (batchMode === 'migrate' ? batchCaps.canMigrate : batchCaps.canRestore)
+                  : (batchCaps.canMigrate || batchCaps.canRestore);
+                const checkboxHintForMode = batchMode === 'migrate'
+                  ? '已进入批量迁移，只能选择可迁移的应用'
+                  : batchMode === 'restore'
+                    ? '已进入批量还原，只能选择可还原的应用'
+                    : '';
                 return (
                   <AppRow
                     key={key}
                     app={app}
                     iconsLoading={iconsLoading}
+                    showSelectionColumn={!!onToggleSelect}
+                    showCheckbox={batchCaps.canMigrate || batchCaps.canRestore}
+                    checkboxDisabled={!selectableForMode}
+                    checkboxHint={checkboxHintForMode}
+                    batchMode={currentBatchMode}
                     onMigrate={onMigrate}
                     onRestore={onRestore}
                     onUninstall={onUninstall}
@@ -787,7 +866,6 @@ export default function AppList({
                     onOpenMigratedParent={onOpenMigratedParent}
                     isSelected={selectedKeys?.has(key)}
                     onToggleSelect={onToggleSelect}
-                    showCheckbox={!!onToggleSelect}
                     // 后台线程以 install_location 为 key 推送大小
                     // 兼容 registry-scanned 应用（key = registry_path）和非注册表应用（key = install_location）
                     appSize={sizeMap?.get(key) ?? sizeMap?.get(app.install_location.toLowerCase())}
