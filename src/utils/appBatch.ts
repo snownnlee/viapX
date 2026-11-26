@@ -43,7 +43,3 @@ export function appBatchCaps(input: BatchCapsInput): AppBatchCaps {
 export function appBatchKey(app: { registry_path?: string; install_location: string }): string {
   return app.registry_path || app.install_location;
 }
-
-export function batchModeLabel(mode: BatchMode): string {
-  return mode === 'migrate' ? '批量迁移' : '批量还原';
-}

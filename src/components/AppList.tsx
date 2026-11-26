@@ -405,6 +405,10 @@ export default function AppList({
   scanPhase,
   // scanTotalCount = 0,
 }: AppListProps) {
+  // 仅链接模式下"还原"实际是"修复链接"，工具栏文案跟随模式
+  const restoreMode = useRestoreMode();
+  const restoreWord = restoreActionLabel(restoreMode);
+
   const defaultOpenFolder = async (app: InstalledApp) => {
     try {
       const { invoke } = await import('@tauri-apps/api/core');
@@ -710,14 +714,14 @@ export default function AppList({
                   disabled={operationsLocked}
                   className="text-[11px] btn-link"
                 >
-                  全选可还原
+                  全选可{restoreWord}
                 </button>
               </>
             ) : (
               <button onClick={() => onSelectAll()} disabled={operationsLocked} className="text-[11px] btn-link">
                 {selectableCount > 0 && selectedKeys && selectedKeys.size >= selectableCount
                   ? '取消全选'
-                  : (currentBatchMode === 'restore' ? '全选可还原' : '全选可迁移')}
+                  : (currentBatchMode === 'restore' ? `全选可${restoreWord}` : '全选可迁移')}
               </button>
             )}
             {batchMigrating ? (
@@ -738,7 +742,7 @@ export default function AppList({
                 style={{ visibility: selectedKeys && selectedKeys.size > 0 ? 'visible' : 'hidden' }}
               >
                 <RotateCcw className="w-3 h-3" />
-                批量还原 ({selectedKeys?.size ?? 0})
+                批量{restoreWord} ({selectedKeys?.size ?? 0})
               </button>
             ) : (
               <button
@@ -839,9 +843,9 @@ export default function AppList({
                   ? (batchMode === 'migrate' ? batchCaps.canMigrate : batchCaps.canRestore)
                   : (batchCaps.canMigrate || batchCaps.canRestore);
                 const checkboxHintForMode = batchMode === 'migrate'
-                  ? '已进入批量迁移，只能选择可迁移的应用'
+                  ? '已进入批量迁移，只能勾选可迁移的应用'
                   : batchMode === 'restore'
-                    ? '已进入批量还原，只能选择可还原的应用'
+                    ? `已进入批量${restoreWord}，只能勾选同类的应用`
                     : '';
                 return (
                   <AppRow

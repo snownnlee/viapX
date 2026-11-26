@@ -21,7 +21,7 @@ import {
   parseTargetEmptyConfirm,
   parseTargetExistsConflict,
 } from '../utils/migrationMessages';
-import { buildEmptyTargetWarning, buildRestoreConfirm } from '../utils/restoreMode';
+import { buildEmptyTargetWarning, buildRestoreConfirm, restoreActionLabel } from '../utils/restoreMode';
 import { useRestoreMode } from '../hooks/useRestoreMode';
 import { findMigratedParent, type MigratedParent } from '../utils/migratedParent';
 import { appBatchCaps, appBatchKey, type BatchMode } from '../utils/appBatch';
@@ -212,6 +212,7 @@ async function resolveMigrationTarget(
 export default function AppMigration({ visible }: { visible: boolean }) {
   // 当前还原模式：仅链接模式下按钮实际是「修复链接」，文案随模式变化
   const restoreMode = useRestoreMode();
+  const restoreWord = restoreActionLabel(restoreMode);
   const [apps, setApps] = useState<InstalledApp[]>([]);
   const [appsLoading, setAppsLoading] = useState(true);
   const [sizesLoading, setSizesLoading] = useState(false);
@@ -1890,7 +1891,7 @@ export default function AppMigration({ visible }: { visible: boolean }) {
     const copy = buildRestoreConfirm(restoreMode, `${selectedApps.length} 个应用`, '还原');
     const confirmed = await confirm(
       `${copy.message}\n\n批量过程不会逐个弹窗：目标为空或原路径冲突的应用会被跳过并列入结果清单。`,
-      { title: '确认批量还原', kind: 'warning', okLabel: copy.okLabel, cancelLabel: '取消' },
+      { title: `确认批量${restoreWord}`, kind: 'warning', okLabel: copy.okLabel, cancelLabel: '取消' },
     );
     if (!confirmed) return;
 
@@ -1903,7 +1904,7 @@ export default function AppMigration({ visible }: { visible: boolean }) {
 
     setMigrationModalOpen(true);
     setMigrationStep('copying');
-    setMigrationMessage('准备开始批量还原...');
+    setMigrationMessage(`准备开始批量${restoreWord}...`);
     setMigrationProgress(0);
     setLockedProcesses([]);
 
@@ -1984,9 +1985,9 @@ export default function AppMigration({ visible }: { visible: boolean }) {
 
     const successCount = results.filter(item => item.status === 'success').length;
     if (results.length === 0) {
-      showToast('批量还原已停止，没有开始任何项目', 'info');
+      showToast(`批量${restoreWord}已停止，没有开始任何项目`, 'info');
     } else if (successCount === results.length) {
-      showToast(`批量还原完成：${successCount} 个全部成功`, 'success');
+      showToast(`批量${restoreWord}完成：${successCount} 个全部成功`, 'success');
     } else {
       setBatchReport({ items: results, cancelled: batchCancelledRef.current });
       setBatchReportVisible(true);
@@ -2164,7 +2165,7 @@ export default function AppMigration({ visible }: { visible: boolean }) {
       <BatchMigrationReport
         isOpen={batchReportVisible}
         onClose={() => setBatchReportVisible(false)}
-        title={batchRunningMode === 'restore' ? '应用还原' : '应用迁移'}
+        title={batchRunningMode === 'restore' ? `应用${restoreWord}` : '应用迁移'}
         items={batchReport.items}
         cancelled={batchReport.cancelled}
       />
