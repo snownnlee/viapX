@@ -283,6 +283,32 @@ pub struct MigrationConfirm {
     pub force_lock_continue: bool,
 }
 
+/// 是否需要做占用预检
+///
+/// 三个条件同时成立才扫：跨盘复制（同盘走 rename，不打开源文件）、用户没点过
+/// 「忽略并继续」、设置里没关掉检测。用户确认后重试时跳过整棵重扫，
+/// 否则大目录会白白多扫一遍，而结果必然是刚被接受的那一份。
+fn should_probe_locks(
+    cross_drive_copy: bool,
+    force_lock_continue: bool,
+    skip_lock_check: bool,
+) -> bool {
+    cross_drive_copy && !force_lock_continue && !skip_lock_check
+}
+
+#[cfg(test)]
+mod lock_probe_tests {
+    use super::should_probe_locks;
+
+    #[test]
+    fn probe_only_for_cross_drive_first_attempt() {
+        assert!(should_probe_locks(true, false, false), "跨盘首次迁移要预检");
+        assert!(!should_probe_locks(false, false, false), "同盘 rename 不需要预检");
+        assert!(!should_probe_locks(true, true, false), "用户确认放行后不再重扫");
+        assert!(!should_probe_locks(true, false, true), "设置里关闭检测时跳过");
+    }
+}
+
 /// 核心迁移命令
 /// 将应用从源路径迁移到目标路径，并创建目录链接（同卷 Junction / 跨卷软链接）
 pub fn migrate_app(
@@ -546,9 +572,20 @@ pub fn migrate_app(
         // （rename 被占用阻塞时会由 rename 自身报错，提示同样明确）。
         // 跨盘复制才需要提前发现"复制到一半才失败"的情况。
         let cross_drive_copy = !same_drive;
-        let lock_report = if cross_drive_copy
-            && !crate::storage::user_settings::load_current_settings().skip_lock_check
-        {
+        // 用户已在弹窗里确认过预检结果：不再整棵重扫（大目录二次全扫代价明显，
+        // 且结果必然是刚被接受的那一份），直接进入复制；新出现的占用由复制阶段报错
+        if force_lock_continue {
+            log_warn!(
+                "migration",
+                "占用预检已由用户确认放行，跳过重复扫描: {}",
+                source
+            );
+        }
+        let lock_report = if should_probe_locks(
+            cross_drive_copy,
+            force_lock_continue,
+            crate::storage::user_settings::load_current_settings().skip_lock_check,
+        ) {
             match check_file_locks(&copy_plan, cancel_flag, &reporter) {
                 // 取消必须与"有占用"区分开，否则会把用户取消误报成占用
                 LockCheckOutcome::Cancelled => return Err("用户取消了迁移".to_string()),
@@ -563,22 +600,21 @@ pub fn migrate_app(
         }
         let lock_blocking = lock_report.blocking_count();
         if lock_blocking > 0 {
-            // 只报可忽略项的检测结果不算阻塞，但不可忽略项必须由用户明确同意才能继续
-            if !force_lock_continue {
-                return Ok(MigrationResult {
-                    success: false,
-                    message: lock_warning_message(&source, &lock_report),
-                    new_path: None,
-                });
-            }
+            // 只报可忽略项的检测结果不算阻塞，但不可忽略项必须先由用户确认；
+            // 确认后前端会带 force_lock_continue 重试，届时不会再进预检
             log_warn!(
                 "migration",
-                "预检命中 {} 项（权限受限 {} / 被占用 {}），用户选择继续: {}",
+                "预检命中 {} 项（权限受限 {} / 被占用 {}），等待用户确认: {}",
                 lock_blocking,
                 lock_report.denied,
                 lock_report.busy,
                 source
             );
+            return Ok(MigrationResult {
+                success: false,
+                message: lock_warning_message(&source, &lock_report),
+                new_path: None,
+            });
         } else if lock_report.rebuildable > 0 {
             log_warn!(
                 "migration",
