@@ -57,9 +57,9 @@ pub(crate) fn repair_migrated_app_permissions() -> AclRepairReport {
 pub(crate) use cleanup::{remove_directory_robust, schedule_remove_on_reboot};
 use copy_engine::{build_copy_plan, copy_dir};
 use danger_rules::{check_dangerous_path, DangerLevel};
-use links::{
+pub(crate) use links::{
     create_directory_link, create_migration_backup_path, preflight_directory_link,
-    restore_source_from_backup, verify_directory_link,
+    remove_directory_link, restore_source_from_backup, verify_directory_link,
 };
 use occupancy::{check_file_locks, LockCheckOutcome, LockReport};
 

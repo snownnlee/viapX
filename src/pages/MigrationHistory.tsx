@@ -8,13 +8,14 @@ import { confirm } from '@tauri-apps/plugin-dialog';
 import {
   History, RotateCcw, RefreshCw, Loader2,
   FolderArchive, AppWindow, ArrowRight, CheckCircle2, AlertTriangle,
-  Search, X, ChevronDown, ChevronUp, ArrowUpDown, ArrowUp, ArrowDown, Trash2, Link2, HardDrive, FolderOpen, Archive,
+  Search, X, ChevronDown, ChevronUp, ArrowUpDown, ArrowUp, ArrowDown, Trash2, Link2, HardDrive, FolderOpen, Archive, Wrench,
 } from 'lucide-react';
-import { MigrationProgressEvent, MigrationRecord, MigrationRecordSizeEvent, MigrationResult } from '../types';
+import { MigrationProgressEvent, MigrationRecord, MigrationRecordSizeEvent, MigrationResult, DriveRepairResult } from '../types';
 import Toast, { useToast } from '../components/Toast';
 import FilterSelect from '../components/FilterSelect';
 import EmptyState from '../components/EmptyState';
 import LinkRecoveryModal from '../components/LinkRecoveryModal';
+import DriveRepairModal from '../components/DriveRepairModal';
 import ContextMenu from '../components/ContextMenu';
 import Checkbox from '../components/Checkbox';
 import Modal from '../components/Modal';
@@ -425,6 +426,8 @@ export default function MigrationHistory({ visible: _visible }: { visible: boole
   const [sortBy, setSortBy] = useState<SortBy>('date_desc');
   // 迁移记录重建弹窗：仅在用户点击时打开（不做自动检查）
   const [linkRecoveryOpen, setLinkRecoveryOpen] = useState(false);
+  // 盘符修正弹窗：数据盘盘符变化后批量改写记录里的路径
+  const [driveRepairOpen, setDriveRepairOpen] = useState(false);
   const [sizeScanRunning, setSizeScanRunning] = useState(false);
   // 右键菜单与删除确认
   const [rowMenu, setRowMenu] = useState<{ record: MigrationRecord; x: number; y: number } | null>(null);
@@ -536,6 +539,27 @@ export default function MigrationHistory({ visible: _visible }: { visible: boole
       console.error('Failed to load history:', error);
       showToast('加载历史记录失败', 'error');
     } finally { setLoading(false); }
+  }
+
+  /** 盘符修正完成：汇总结果并刷新列表 */
+  function handleDriveRepairApplied(result: DriveRepairResult) {
+    const parts = [
+      result.records_updated > 0 ? `记录 ${result.records_updated} 条` : '',
+      result.metadata_updated > 0 ? `元数据 ${result.metadata_updated} 条` : '',
+      result.custom_folders_updated > 0 ? `自定义文件夹 ${result.custom_folders_updated} 个` : '',
+      result.links_rebuilt > 0 ? `重建链接 ${result.links_rebuilt} 个` : '',
+    ].filter(Boolean);
+    const summary = parts.length > 0 ? parts.join('、') : '没有需要修正的内容';
+    if (result.link_failures.length > 0) {
+      showToast(
+        `盘符修正完成：${summary}；${result.link_failures.length} 个链接未重建（${result.link_failures[0]}）`,
+        'error',
+        12000,
+      );
+    } else {
+      showToast(`盘符修正完成：${summary}`, 'success', 8000);
+    }
+    loadHistory();
   }
 
   /** 清理损坏的迁移记录（用户手动绕过 Viap 操作导致，直接清理残留） */
@@ -896,6 +920,14 @@ export default function MigrationHistory({ visible: _visible }: { visible: boole
             </button>
           )}
           <button
+            onClick={() => setDriveRepairOpen(true)}
+            className="btn h-8 text-[12px] flex-shrink-0"
+            title="数据盘盘符变化后，批量修正记录、兜底元数据、自定义文件夹里的盘符，并重建原路径链接"
+          >
+            <Wrench className="w-3.5 h-3.5" />
+            盘符修正
+          </button>
+          <button
             onClick={() => setLinkRecoveryOpen(true)}
             className="btn h-8 text-[12px] flex-shrink-0"
             title="记录被误删后，扫描目录联接重建迁移记录"
@@ -1081,6 +1113,12 @@ export default function MigrationHistory({ visible: _visible }: { visible: boole
         isOpen={linkRecoveryOpen}
         onClose={() => setLinkRecoveryOpen(false)}
         onImported={() => { loadHistory(); }}
+      />
+
+      <DriveRepairModal
+        isOpen={driveRepairOpen}
+        onClose={() => setDriveRepairOpen(false)}
+        onApplied={handleDriveRepairApplied}
       />
 
       {/* Toast 根据通知类型自动选择停留时间，错误提示默认更久。 */}

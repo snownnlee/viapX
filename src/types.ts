@@ -474,3 +474,56 @@ export interface MigrationRecord {
   // 还原时是否保留了目标副本（保留模式）；旧记录缺省 false
   target_kept: boolean;
 }
+
+// ============================================================================
+// 迁移记录盘符修正
+// ============================================================================
+
+/** 单条路径改写预览 */
+export interface DriveRepairItem {
+  id: string;
+  app_name: string;
+  from: string;
+  to: string;
+  /** 改写后的新路径当前是否存在 */
+  new_exists: boolean;
+}
+
+/** 需要重建的原路径链接 */
+export interface DriveLinkItem {
+  id: string;
+  app_name: string;
+  original_path: string;
+  from_target: string;
+  to_target: string;
+}
+
+/** 盘符修正可选盘符 */
+export interface DriveRepairDrives {
+  /** 记录中出现过的盘符（大写字母） */
+  record_drives: string[];
+  /** 当前系统存在的盘符 */
+  existing_drives: string[];
+}
+
+/** 盘符修正预览结果 */
+export interface DriveRepairPreview {
+  old_drive: string;
+  new_drive: string;
+  new_drive_exists: boolean;
+  target_items: DriveRepairItem[];
+  original_items: DriveRepairItem[];
+  metadata_count: number;
+  custom_folder_count: number;
+  links: DriveLinkItem[];
+}
+
+/** 盘符修正执行结果 */
+export interface DriveRepairResult {
+  records_updated: number;
+  metadata_updated: number;
+  custom_folders_updated: number;
+  links_rebuilt: number;
+  link_failures: string[];
+  backup_path: string | null;
+}
