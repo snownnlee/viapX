@@ -234,6 +234,51 @@ pub enum MigrationRecordType {
     LargeFolder,
 }
 
+/// 还原模式：决定还原时如何处理原路径与目标数据
+///
+/// - `LinkOnly`：只在原路径创建或修复链接，数据始终留在目标盘，迁移关系不变
+/// - `KeepData`：数据复制回原路径，目标副本保留（占双份空间，可再次取用）
+/// - `Move`：数据复制回原路径并删除目标副本（原有行为）
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreMode {
+    #[default]
+    LinkOnly,
+    KeepData,
+    Move,
+}
+
+impl RestoreMode {
+    /// 设置文件里存字符串，遇到未知值回退默认模式而不是让整份设置解析失败
+    pub const DEFAULT_KEY: &'static str = "link_only";
+
+    pub fn as_key(self) -> &'static str {
+        match self {
+            RestoreMode::LinkOnly => Self::DEFAULT_KEY,
+            RestoreMode::KeepData => "keep_data",
+            RestoreMode::Move => "move",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "link_only" => Some(RestoreMode::LinkOnly),
+            "keep_data" => Some(RestoreMode::KeepData),
+            "move" => Some(RestoreMode::Move),
+            _ => None,
+        }
+    }
+
+    /// 中文名，用于后端直接拼进结果消息
+    pub fn label(self) -> &'static str {
+        match self {
+            RestoreMode::LinkOnly => "仅链接模式",
+            RestoreMode::KeepData => "保留模式",
+            RestoreMode::Move => "移动模式",
+        }
+    }
+}
+
 /// 迁移历史记录结构体
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MigrationRecord {
@@ -254,9 +299,23 @@ pub struct MigrationRecord {
     /// 记录类型，旧记录默认为 App（向后兼容）
     #[serde(default = "default_record_type")]
     pub record_type: MigrationRecordType,
+    /// 还原时是否保留了目标副本（保留模式），旧记录缺省 false
+    #[serde(default)]
+    pub target_kept: bool,
 }
 
 fn default_record_type() -> MigrationRecordType { MigrationRecordType::App }
+
+/// 保留模式还原后仍可再次还原的条目（供数据迁移页展示「恢复」入口）
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeptRestoreInfo {
+    /// 对应的迁移记录 ID
+    pub history_id: String,
+    /// 原路径（当前已还原为真实目录）
+    pub original_path: String,
+    /// 仍保留的目标副本路径
+    pub target_path: String,
+}
 
 /// 历史记录持久化存储结构
 #[derive(Debug, Serialize, Deserialize)]

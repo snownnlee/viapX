@@ -118,6 +118,16 @@ export function buildLockWarningPrompt(warning: LockWarning): string {
 }
 
 /**
+ * 解析「目标目录为空」确认协议，返回目标路径。
+ * 空目录不再静默拒绝/清理，由前端弹窗让用户选择继续还是取消。
+ */
+export function parseTargetEmptyConfirm(message: string): string | null {
+  const prefix = 'TARGET_EMPTY_CONFIRM:';
+  if (!message.startsWith(prefix)) return null;
+  return message.slice(prefix.length).trim();
+}
+
+/**
  * 将后端迁移内部协议和兜底错误统一转成中文用户提示。
  * 控制协议仍保留给流程判断使用，但任何进入 UI 的文本都应走这里。
  */
@@ -149,6 +159,11 @@ export function formatMigrationFailureMessage(message: string): string {
   if (safeMessage.startsWith('REQUIRES_WARNING_CONFIRM:')) {
     const detail = safeMessage.replace('REQUIRES_WARNING_CONFIRM:', '').trim();
     return `该目录属于高风险路径，需要通过风险确认后才能迁移。\n\n${detail}`;
+  }
+
+  const emptyTarget = parseTargetEmptyConfirm(safeMessage);
+  if (emptyTarget !== null) {
+    return `目标目录为空，没有可恢复的数据：\n${emptyTarget}\n\n如果是应用已被卸载或数据被清理，该记录不再需要还原。`;
   }
 
   const lockWarning = parseLockWarning(safeMessage);

@@ -18,8 +18,12 @@ import {
   buildLockWarningPrompt,
   formatMigrationFailureMessage,
   parseLockWarning,
+  parseTargetEmptyConfirm,
   parseTargetExistsConflict,
 } from '../utils/migrationMessages';
+import { buildEmptyTargetWarning, buildRestoreConfirm } from '../utils/restoreMode';
+import { useRestoreMode } from '../hooks/useRestoreMode';
+import { findMigratedParent, type MigratedParent } from '../utils/migratedParent';
 import {
   buildBatchConfirmMessage, getAvailableSpaceForPath, type BatchReportItem,
 } from '../utils/batchMigration';
@@ -205,6 +209,8 @@ async function resolveMigrationTarget(
 }
 
 export default function AppMigration({ visible }: { visible: boolean }) {
+  // 当前还原模式：仅链接模式下按钮实际是「修复链接」，文案随模式变化
+  const restoreMode = useRestoreMode();
   const [apps, setApps] = useState<InstalledApp[]>([]);
   const [appsLoading, setAppsLoading] = useState(true);
   const [sizesLoading, setSizesLoading] = useState(false);
@@ -226,6 +232,10 @@ export default function AppMigration({ visible }: { visible: boolean }) {
 
   // 已迁移的路径列表
   const [migratedPaths, setMigratedPaths] = useState<string[]>([]);
+  // 保留模式还原后仍保留副本的路径 → 副本路径（小写原路径为 key），用于继续提供「恢复」入口
+  const [keptRestoreTargets, setKeptRestoreTargets] = useState<Record<string, string>>({});
+  // 已迁移的上级目录：位于其中的应用不能单独迁移/还原，需到数据迁移页处理父目录
+  const [migratedParents, setMigratedParents] = useState<MigratedParent[]>([]);
   // 强制删除前的相关进程提示
   const [forceRmProcesses, setForceRmProcesses] = useState<AppProcessInfo[]>([]);
   const [killingProcesses, setKillingProcesses] = useState(false);
@@ -667,11 +677,31 @@ export default function AppMigration({ visible }: { visible: boolean }) {
       const records = await invoke<MigrationRecord[]>('get_migration_history');
       const appRecords = records.filter(record => record.record_type === 'App');
       setAppMigrationRecords(appRecords);
-      setMigratedPaths(appRecords.map(record => record.original_path));
+      // 只有 active 记录才算"已迁移"；保留模式还原后的记录单独作为"可再次恢复"
+      setMigratedPaths(appRecords.filter(record => record.status === 'active').map(record => record.original_path));
+      const kept: Record<string, string> = {};
+      for (const record of appRecords) {
+        if (record.status !== 'active' && record.target_kept) {
+          kept[record.original_path.toLowerCase()] = record.target_path;
+        }
+      }
+      setKeptRestoreTargets(kept);
+      // 父目录迁移用全部记录（含 LargeFolder），应用列表据此判断"随父目录被迁移"
+      setMigratedParents(
+        records
+          .filter(record => record.status === 'active')
+          .map(record => ({
+            originalPath: record.original_path,
+            targetPath: record.target_path,
+            appName: record.app_name,
+          })),
+      );
     } catch (error) {
       logger.error('获取应用迁移记录失败:', error);
       setAppMigrationRecords([]);
       setMigratedPaths([]);
+      setKeptRestoreTargets({});
+      setMigratedParents([]);
     }
   }
 
@@ -752,16 +782,37 @@ export default function AppMigration({ visible }: { visible: boolean }) {
     }
   }
 
+  /** 应用随父目录迁移：不能单独还原，跳到数据迁移页处理那个目录 */
+  function handleOpenMigratedParent(parent: MigratedParent) {
+    showToast(
+      `该应用位于已迁移目录「${parent.appName}」内，数据在 ${parent.targetPath}；请在数据迁移页恢复该目录（应用本身不能单独还原）`,
+      'info',
+      8000,
+    );
+    setActiveTab?.('folders');
+  }
+
   // 还原流程：将已迁移应用恢复到原始位置
   async function handleRestore(app: InstalledApp) {
-    const record = appMigrationRecords.find(r =>
-      r.original_path.toLowerCase() === app.install_location.toLowerCase()
-    );
+    const appPath = app.install_location.toLowerCase();
+    // 优先用活跃记录；没有活跃记录但有保留副本时，允许从副本再次还原
+    const record = appMigrationRecords.find(r => r.status === 'active' && r.original_path.toLowerCase() === appPath)
+      ?? appMigrationRecords.find(r => r.status !== 'active' && r.target_kept && r.original_path.toLowerCase() === appPath);
 
     if (!record) {
       showToast('未找到该应用的迁移记录，无法执行还原', 'error');
       return;
     }
+
+    // 按当前模式提示将要执行的动作（模式由顶部菜单统一配置，此处不提供切换）
+    const copy = buildRestoreConfirm(restoreMode, `应用「${app.display_name}」`);
+    const confirmed = await confirm(copy.message, {
+      title: copy.title,
+      kind: 'info',
+      okLabel: copy.okLabel,
+      cancelLabel: '取消',
+    });
+    if (!confirmed) return;
 
     const currentRestoreKey = `${app.display_name}|${app.registry_path}`;
     let unlisten: UnlistenFn | null = null;
@@ -782,18 +833,42 @@ export default function AppMigration({ visible }: { visible: boolean }) {
         logger.error('注册恢复进度监听失败:', error);
       }
 
-      const result = await invoke<MigrationResult>('restore_app', {
+      let result = await invoke<MigrationResult>('restore_app', {
         historyId: record.id,
       });
 
+      // 目标目录为空时不再静默拒绝：先告知后果，再由用户选择继续或取消
+      const emptyTarget = parseTargetEmptyConfirm(result.message);
+      if (!result.success && emptyTarget) {
+        const proceed = await confirm(buildEmptyTargetWarning(restoreMode, emptyTarget), {
+          title: '目标目录为空',
+          kind: 'warning',
+          okLabel: '继续还原',
+          cancelLabel: '取消',
+        });
+        if (!proceed) {
+          showToast('已取消：目标目录为空，未做任何改动', 'info');
+          return;
+        }
+        result = await invoke<MigrationResult>('restore_app', {
+          historyId: record.id,
+          forceEmptyContinue: true,
+        });
+      }
+
       if (result.success) {
-        showToast(`${app.display_name} 已成功还原`, 'success');
+        showToast(
+          restoreMode === 'link_only'
+            ? `${app.display_name} 的目录链接已就绪，数据仍在目标盘`
+            : `${app.display_name} 已成功还原`,
+          'success',
+        );
         await handleRefresh();
       } else {
-        showToast(result.message || '还原失败', 'error');
+        showToast(result.message || (restoreMode === 'link_only' ? '修复链接失败' : '还原失败'), 'error');
       }
     } catch (error) {
-      showToast(`还原失败: ${error}`, 'error');
+      showToast(`${restoreMode === 'link_only' ? '修复链接失败' : '还原失败'}: ${error}`, 'error');
     } finally {
       setRestoreProgressMap(prev => {
         const next = { ...prev };
@@ -1497,6 +1572,7 @@ export default function AppMigration({ visible }: { visible: boolean }) {
       !migratedPaths.some(
         (p) => p.toLowerCase() === a.install_location.toLowerCase()
       ) && !isViapSelf(a) // Viap 自身不可迁移，排除在批量操作之外
+      && !findMigratedParent(a.install_location, migratedParents) // 随父目录迁移的不能单独迁移
     );
     setSelectedKeys((prev) => {
       if (prev.size === selectable.length) {
@@ -1515,6 +1591,7 @@ export default function AppMigration({ visible }: { visible: boolean }) {
       selectedKeys.has(app.registry_path || app.install_location)
       && !isViapSelf(app)
       && !migratedPaths.some((p) => p.toLowerCase() === app.install_location.toLowerCase())
+      && !findMigratedParent(app.install_location, migratedParents)
     );
     if (selectedApps.length === 0) return;
 
@@ -1877,6 +1954,9 @@ export default function AppMigration({ visible }: { visible: boolean }) {
             restoringKey={restoringKey}
             restoreProgressMap={restoreProgressMap}
             migratedPaths={migratedPaths}
+            keptRestoreTargets={keptRestoreTargets}
+            migratedParents={migratedParents}
+            onOpenMigratedParent={handleOpenMigratedParent}
             selectedKeys={selectedKeys}
             onToggleSelect={handleToggleSelect}
             onSelectAll={handleSelectAll}

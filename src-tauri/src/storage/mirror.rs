@@ -355,6 +355,7 @@ mod tests {
                     migrated_at: 1,
                     status: "active".to_string(),
                     record_type: MigrationRecordType::App,
+                    target_kept: false,
                 })
                 .collect(),
         }

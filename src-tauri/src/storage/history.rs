@@ -94,6 +94,10 @@ fn save_history_inner(storage: &HistoryStorage, update_mirror: bool) -> Result<(
 /// 判断目录是否为空，只用于安全清理“卸载后留下的空目录”。
 ///
 /// 这里禁止跟随 Junction，避免把目标目录误当成普通空目录并扩大清理范围。
+/// 目标目录为空时返回给前端的确认协议前缀（后接目标路径）：
+/// 空目录仍可能是用户想保留的"空壳"，不静默清理，交回用户决定继续还是取消
+pub(crate) const TARGET_EMPTY_CONFIRM_PREFIX: &str = "TARGET_EMPTY_CONFIRM:";
+
 pub(crate) fn is_empty_directory(path: &Path) -> Result<bool, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|e| format!("读取目录状态失败 {}: {}", path.display(), e))?;
@@ -185,6 +189,7 @@ pub fn add_migration_record(
         migrated_at: timestamp,
         status: "active".to_string(),
         record_type,
+        target_kept: false,
     });
 
     save_history(&storage)?;
@@ -233,6 +238,7 @@ pub fn add_recovered_records(entries: &[RecoveredLinkImport]) -> Result<(u32, u3
             migrated_at: timestamp,
             status: "active".to_string(),
             record_type: entry.record_type.clone(),
+            target_kept: false,
         });
         added += 1;
     }
@@ -303,12 +309,17 @@ fn update_record_size(id: &str, size: u64) -> Result<(), String> {
 }
 
 /// 更新迁移记录状态（按 original_path 大小写不敏感匹配）
-pub fn update_migration_record_status(original_path: &str, new_status: &str) -> Result<(), String> {
+pub fn update_migration_record_status(
+    original_path: &str,
+    new_status: &str,
+    target_kept: bool,
+) -> Result<(), String> {
     let mut storage = load_history();
 
     let found = storage.records.iter_mut().any(|record| {
         if record.original_path.eq_ignore_ascii_case(original_path) && record.status == "active" {
             record.status = new_status.to_string();
+            record.target_kept = target_kept;
             true
         } else {
             false
@@ -405,11 +416,12 @@ pub fn cleanup_broken_record(history_id: String) -> Result<MigrationResult, Stri
 // ============================================================================
 
 /// 按记录 ID 更新状态
-pub fn update_record_status_by_id(id: &str, new_status: &str) -> Result<(), String> {
+pub fn update_record_status_by_id(id: &str, new_status: &str, target_kept: bool) -> Result<(), String> {
     let mut storage = load_history();
     let found = storage.records.iter_mut().any(|r| {
         if r.id == id {
             r.status = new_status.to_string();
+            r.target_kept = target_kept;
             true
         } else {
             false
@@ -425,7 +437,34 @@ pub fn update_record_status_by_id(id: &str, new_status: &str) -> Result<(), Stri
 #[tauri::command]
 pub fn get_migration_history() -> Result<Vec<MigrationRecord>, String> {
     let storage = load_history();
-    Ok(storage.records.into_iter().filter(|r| r.status == "active").collect())
+    Ok(storage.records.into_iter().filter(is_record_visible).collect())
+}
+
+/// 记录是否应出现在迁移记录列表里
+///
+/// 除了活跃记录，保留模式还原后的记录也要保留：目标副本还在，可以再次还原。
+pub(crate) fn is_record_visible(record: &MigrationRecord) -> bool {
+    record.status == "active" || (record.status == "restored" && record.target_kept)
+}
+
+/// 列出保留模式还原后、目标副本仍在的记录
+///
+/// 数据迁移页据此在"已还原但副本还在"的文件夹上继续提供「恢复」入口，
+/// 避免用户只能看着一份可用副本却无从操作。
+#[tauri::command]
+pub fn list_kept_restores() -> Result<Vec<KeptRestoreInfo>, String> {
+    let storage = load_history();
+    Ok(storage
+        .records
+        .into_iter()
+        .filter(|record| record.status == "restored" && record.target_kept)
+        .filter(|record| Path::new(&record.target_path).exists())
+        .map(|record| KeptRestoreInfo {
+            history_id: record.id,
+            original_path: record.original_path,
+            target_path: record.target_path,
+        })
+        .collect())
 }
 
 /// 获取所有已迁移应用的原始路径列表
@@ -443,7 +482,7 @@ pub fn get_migrated_paths() -> Result<Vec<String>, String> {
 pub fn check_link_status(record_id: String) -> Result<LinkStatusResult, String> {
     let storage = load_history();
 
-    let record = match storage.records.iter().find(|r| r.id == record_id && r.status == "active") {
+    let record = match storage.records.iter().find(|r| r.id == record_id && is_record_visible(r)) {
         Some(r) => r,
         None => return Ok(LinkStatusResult {
             healthy: false, target_exists: false, is_junction: false,
@@ -838,9 +877,14 @@ pub fn import_history(src_path: String) -> Result<u32, String> {
 /// 5. 移动文件回原位置（失败时回滚重建 Junction）
 /// 6. 更新记录状态
 #[tauri::command]
-pub fn restore_app(history_id: String, app_handle: tauri::AppHandle) -> Result<MigrationResult, String> {
+pub fn restore_app(
+    history_id: String,
+    force_empty_continue: Option<bool>,
+    app_handle: tauri::AppHandle,
+) -> Result<MigrationResult, String> {
     #[cfg(windows)]
     {
+        let force_empty = force_empty_continue.unwrap_or(false);
         // 步骤 0: 尝试获取恢复锁，防止并发恢复任务互相干扰
         let _guard = match utils::try_acquire_restore_lock() {
             Ok(guard) => guard,
@@ -852,7 +896,8 @@ pub fn restore_app(history_id: String, app_handle: tauri::AppHandle) -> Result<M
         // 步骤 1: 查找记录
         let mut storage = load_history();
 
-        let record_index = match storage.records.iter().position(|r| r.id == history_id && r.status == "active") {
+        // 已还原但保留目标副本的记录允许再次还原，因此列表与还原入口都按同一判据
+        let record_index = match storage.records.iter().position(|r| r.id == history_id && is_record_visible(r)) {
             Some(i) => i,
             None => return Ok(MigrationResult {
                 success: false,
@@ -864,17 +909,25 @@ pub fn restore_app(history_id: String, app_handle: tauri::AppHandle) -> Result<M
         let record = storage.records[record_index].clone();
 
         // 应用已被外部卸载后，原路径可能消失，目标目录也可能只剩空壳。
-        // 此时不能创建空的原安装目录冒充恢复成功，先由后端更新记录并明确提示用户。
+        // 目标完全消失 → 确实没有可恢复的数据，按已清理处理；
+        // 目标还在但为空 → 先返回确认协议让用户决定，不静默删除空目录
+        // （空目录也可能是用户有意留下的位置）。
         if !Path::new(&record.original_path).exists()
             && !utils::is_junction(Path::new(&record.original_path))
-            && (!Path::new(&record.target_path).exists()
-                || is_empty_directory(Path::new(&record.target_path))?)
         {
-            if let Some(result) = mark_record_without_recoverable_data(
-                &history_id,
-                "原安装目录已不存在，目标目录为空或已被卸载清理。",
-            )? {
-                return Ok(result);
+            if !Path::new(&record.target_path).exists() {
+                if let Some(result) = mark_record_without_recoverable_data(
+                    &history_id,
+                    "原安装目录已不存在，目标目录也已被卸载清理。",
+                )? {
+                    return Ok(result);
+                }
+            } else if is_empty_directory(Path::new(&record.target_path))? && !force_empty {
+                return Ok(MigrationResult {
+                    success: false,
+                    message: format!("{}{}", TARGET_EMPTY_CONFIRM_PREFIX, record.target_path),
+                    new_path: None,
+                });
             }
         }
 
@@ -886,11 +939,15 @@ pub fn restore_app(history_id: String, app_handle: tauri::AppHandle) -> Result<M
                 history_id,
                 record,
                 app_handle,
+                force_empty,
             );
         }
 
         let original_path = Path::new(&record.original_path);
         let target_path = Path::new(&record.target_path);
+
+        // 还原模式由顶部菜单的全局设置决定，前端只负责展示同一份值
+        let mode = crate::storage::user_settings::load_current_settings().restore_mode();
 
         // 步骤 2: 验证状态
         if !target_path.exists() {
@@ -906,8 +963,29 @@ pub fn restore_app(history_id: String, app_handle: tauri::AppHandle) -> Result<M
         // 而 symlink_dir 在未开启开发者模式时实际创建的是 Junction，导致无法恢复
         let is_junction = utils::is_junction(original_path);
 
+        // 保留模式还原过的记录再次还原：原路径已是真实目录时给出针对性说明，
+        // 不能套用"上次恢复未完成"那套文案
+        if mode != RestoreMode::LinkOnly
+            && record.status == "restored"
+            && record.target_kept
+            && original_path.exists()
+            && !is_junction
+        {
+            return Ok(MigrationResult {
+                success: false,
+                message: format!(
+                    "原路径 {} 已是真实目录（保留模式还原后的数据）。\n\n\
+                     要再次从目标副本还原，请先把该目录移走或改名，避免覆盖其中可能的新数据。\n\n\
+                     目标副本仍保留在：{}",
+                    record.original_path, record.target_path
+                ),
+                new_path: None,
+            });
+        }
+
         // 原路径存在但不是 Reparse Point → 真正的普通目录，拒绝恢复保护用户数据
-        if original_path.exists() && !is_junction {
+        // 仅链接模式不做复制，由 restore_link_only 自己给出拒绝说明（它的提示更贴近该模式）
+        if mode != RestoreMode::LinkOnly && original_path.exists() && !is_junction {
             // 原路径是普通目录，说明之前的恢复操作中断了（复制回原位部分成功）
             // 根据 target 是否还存在给出不同提示
             let target_still_exists = target_path.exists()
@@ -963,7 +1041,8 @@ pub fn restore_app(history_id: String, app_handle: tauri::AppHandle) -> Result<M
         // 步骤 3.5: 进程占用检测（必须在删除 Junction 之前）
         // 应用运行中会导致复制/清理失败，提前拒绝可以避免进入恢复半程状态
         // 提前检测并拒绝，不动任何文件，是最安全的策略
-        {
+        // 仅链接模式只操作链接本身，无需应用退出
+        if mode != RestoreMode::LinkOnly {
             let mut sys = sysinfo::System::new_all();
             sys.refresh_all();
             let original_lower = record.original_path.to_lowercase();
@@ -1005,35 +1084,50 @@ pub fn restore_app(history_id: String, app_handle: tauri::AppHandle) -> Result<M
             &app_handle,
             // 应用恢复后要能重新在沙箱里启动，补一次读取权限
             true,
+            mode,
         )?;
 
         // 步骤 6: 更新记录
-        storage.records[record_index].status = "restored".to_string();
-        save_history(&storage)?;
+        // 仅链接模式下应用仍在目标盘运行（原路径只是链接），迁移关系不变，记录必须保持 active
+        if restore_result.action.is_link_only() {
+            log_warn!(
+                "migration",
+                "仅链接模式：{} 的链接已就绪，迁移记录保持 active",
+                record.original_path
+            );
+        } else {
+            storage.records[record_index].status = "restored".to_string();
+            storage.records[record_index].target_kept = restore_result.target_kept;
+            save_history(&storage)?;
 
-        // 同步移除兜底元数据，避免恢复后仍显示为"已迁移"
-        crate::storage::migrated_app_metadata::remove_migrated_app(&record.original_path);
-
-        let mut message = format!(
-            "恢复成功！应用 {} 已从 {} 恢复到 {}（{}）",
-            record.app_name,
-            record.target_path,
-            record.original_path,
-            crate::migration::format_bytes(restore_result.restored_size)
-        );
-        if let Some(warning) = restore_result.cleanup_warning {
-            message.push_str(&format!("\n\n{}", warning));
+            // 同步移除兜底元数据，避免恢复后仍显示为"已迁移"
+            crate::storage::migrated_app_metadata::remove_migrated_app(&record.original_path);
         }
+
+        let message = crate::migration::build_restore_message(
+            &format!("应用 {}", record.app_name),
+            &record.original_path,
+            &record.target_path,
+            mode,
+            restore_result.action,
+            restore_result.restored_size,
+            restore_result.cleanup_warning.as_deref(),
+        );
 
         Ok(MigrationResult {
             success: true,
             message,
-            new_path: Some(record.original_path),
+            new_path: if restore_result.action.is_link_only() {
+                None
+            } else {
+                Some(record.original_path.clone())
+            },
         })
     }
 
     #[cfg(not(windows))]
     {
+        let _ = (&history_id, &force_empty_continue, &app_handle);
         Ok(MigrationResult {
             success: false,
             message: "恢复功能仅支持 Windows 系统".to_string(),

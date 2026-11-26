@@ -13,7 +13,7 @@ mod links;
 mod occupancy;
 mod restore;
 
-pub(crate) use restore::restore_directory_with_progress;
+pub(crate) use restore::{build_restore_message, restore_directory_with_progress};
 // 权限修复实现放在 acl 子模块；非 Windows 的等价函数定义在下方
 #[cfg(windows)]
 pub(crate) use acl::{ensure_app_container_access, repair_migrated_app_permissions};

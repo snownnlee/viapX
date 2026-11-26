@@ -41,11 +41,11 @@ export default function TitleBar({ centerContent, rightContent }: TitleBarProps)
   return (
     <div
       data-tauri-drag-region
-      className="flex items-center h-11 pl-3 pr-0 border-b select-none relative"
+      className="flex items-center h-11 px-2 gap-2 border-b select-none relative"
       style={{ background: 'var(--bg-content)', borderColor: 'var(--border-color)' }}
     >
       {/* 左侧：Logo + 品牌名 */}
-      <div data-tauri-drag-region className="flex items-center gap-2 flex-shrink-0 relative z-10">
+      <div data-tauri-drag-region className="flex items-center gap-1.5 flex-shrink-0 relative z-10">
         <div className="flex items-center justify-center w-6 h-6">
           <img src={ICON} alt="" />
         </div>
@@ -54,15 +54,17 @@ export default function TitleBar({ centerContent, rightContent }: TitleBarProps)
         </span>
       </div>
 
-      {/* 中间：Tab 导航 — 绝对定位实现真正居中 */}
-      <div className="absolute left-1/2 -translate-x-1/2 top-0 bottom-0 flex items-center">
+      {/* 中间：Tab 导航 —— 占满剩余空间并居中。
+          不能再用绝对定位：右侧内容宽度会随功能增加（如还原模式菜单），
+          绝对居中的 Tab 会与右侧控件重叠。 */}
+      <div data-tauri-drag-region className="flex-1 min-w-0 flex items-center justify-center overflow-hidden">
         {centerContent}
       </div>
 
-      {/* 右侧：磁盘状态 + 窗口控制 */}
-      <div className="flex items-center h-full flex-shrink-0 ml-auto relative z-10">
+      {/* 右侧：配置菜单 + 磁盘状态 + 窗口控制 */}
+      <div className="flex items-center h-full flex-shrink-0 gap-2">
         {rightContent && (
-          <div className="flex items-center pr-3">
+          <div className="flex items-center">
             {rightContent}
           </div>
         )}

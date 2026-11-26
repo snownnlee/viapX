@@ -423,6 +423,13 @@ export interface MigrationRecordSizeEvent {
   size: number;
 }
 
+/** 保留模式还原后仍可再次还原的条目（数据迁移页据此显示「恢复」入口） */
+export interface KeptRestoreInfo {
+  history_id: string;
+  original_path: string;
+  target_path: string;
+}
+
 /** 镜像备份信息 */
 export interface MirrorBackupInfo {
   exists: boolean;
@@ -464,4 +471,6 @@ export interface MigrationRecord {
   status: string;
   // 记录类型：App（应用）或 LargeFolder（大文件夹）
   record_type: MigrationRecordType;
+  // 还原时是否保留了目标副本（保留模式）；旧记录缺省 false
+  target_kept: boolean;
 }

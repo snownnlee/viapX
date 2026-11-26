@@ -7,7 +7,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { FolderSync, FolderArchive, History, Settings as SettingsIcon } from 'lucide-react';
 import TitleBar from './components/TitleBar';
 import DiskUsageBar from './components/DiskUsageBar';
+import RestoreModeMenu from './components/RestoreModeMenu';
 import UpdateNotification from './components/UpdateNotification';
+import { persistUserSettings, readLocalUserSettings } from './utils/userSettings';
+import { restoreModeMeta, type RestoreMode } from './utils/restoreMode';
+import { RestoreModeContext } from './hooks/useRestoreMode';
 import AppMigration from './pages/AppMigration';
 import LargeFolders from './pages/LargeFolders';
 import MigrationHistory from './pages/MigrationHistory';
@@ -80,6 +84,15 @@ function App() {
 
   // 初始化主题系统
   const themeState = useTheme();
+
+  // 还原模式：全局设置，顶部菜单改动后立即持久化；后端还原时读同一份配置
+  const [restoreMode, setRestoreMode] = useState<RestoreMode>(() => readLocalUserSettings().restoreMode);
+
+  function handleRestoreModeChange(mode: RestoreMode) {
+    setRestoreMode(mode);
+    persistUserSettings({ ...readLocalUserSettings(), restoreMode: mode }).catch(() => undefined);
+    showToast(`还原模式已切换为「${restoreModeMeta(mode).label}」`, 'info', 2600);
+  }
 
   async function fetchDiskUsage() {
     try {
@@ -162,13 +175,14 @@ function App() {
 
   return (
     <ThemeContext.Provider value={themeState}>
+      <RestoreModeContext.Provider value={restoreMode}>
       <TabNavigationContext.Provider value={setActiveTab}>
       <div className="flex flex-col h-screen overflow-hidden" style={{ background: 'var(--bg-app)' }}>
 
         {/* 统一标题栏：Logo + Tab 导航 + 磁盘状态 + 窗口控制 */}
         <TitleBar
           centerContent={(
-            <div className="flex items-center gap-1 p-0.5 rounded-lg" style={{ background: 'var(--bg-hover)' }}>
+            <div className="flex items-center gap-0.5 p-0.5 rounded-lg" style={{ background: 'var(--bg-hover)' }}>
               {tabs.map((tab) => {
                 const isActive = activeTab === tab.id;
                 const Icon = tab.Icon;
@@ -178,7 +192,7 @@ function App() {
                     key={tab.id}
                     type="button"
                     onClick={() => setActiveTab(tab.id)}
-                    className="flex items-center gap-1.5 h-7 px-3 rounded-md text-[12px] font-medium transition-all duration-200"
+                    className="flex items-center gap-1.5 h-7 px-2.5 rounded-md text-[12px] font-medium whitespace-nowrap flex-shrink-0 transition-all duration-200"
                     style={isActive ? {
                       // 选中态只用「浮起的胶囊 + 柔和投影」表达，不再叠加配色：
                       // 底色取比轨道(--bg-hover)更亮的 --bg-raised，投影把它从凹槽里抬起来；
@@ -199,12 +213,17 @@ function App() {
             </div>
           )}
           rightContent={(
-            <DiskUsageBar
-              disks={disks}
-              loading={diskLoading}
-              refreshing={diskRefreshing}
-              onRefresh={handleRefreshDiskUsage}
-            />
+            <div className="flex items-center gap-2">
+              {/* 还原模式是独立配置项：与磁盘状态之间用细分隔线分开 */}
+              <RestoreModeMenu value={restoreMode} onChange={handleRestoreModeChange} />
+              <div className="h-4 w-px flex-shrink-0" style={{ background: 'var(--border-color)' }} />
+              <DiskUsageBar
+                disks={disks}
+                loading={diskLoading}
+                refreshing={diskRefreshing}
+                onRefresh={handleRefreshDiskUsage}
+              />
+            </div>
           )}
         />
 
@@ -246,6 +265,7 @@ function App() {
       </div>
       {startupVisible && <StartupScreen />}
       </TabNavigationContext.Provider>
+      </RestoreModeContext.Provider>
     </ThemeContext.Provider>
   );
 }

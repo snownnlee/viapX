@@ -477,6 +477,7 @@ pub fn run() {
             // 存储层 — 历史记录
             storage::history::get_migration_history,
             storage::history::get_migrated_paths,
+            storage::history::list_kept_restores,
             storage::history::restore_app,
             storage::history::cleanup_broken_record,
             storage::history::delete_migration_record,

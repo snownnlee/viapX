@@ -8,7 +8,7 @@ import { confirm } from '@tauri-apps/plugin-dialog';
 import {
   History, RotateCcw, RefreshCw, Loader2,
   FolderArchive, AppWindow, ArrowRight, CheckCircle2, AlertTriangle,
-  Search, X, ChevronDown, ChevronUp, ArrowUpDown, ArrowUp, ArrowDown, Trash2, Link2, HardDrive, FolderOpen,
+  Search, X, ChevronDown, ChevronUp, ArrowUpDown, ArrowUp, ArrowDown, Trash2, Link2, HardDrive, FolderOpen, Archive,
 } from 'lucide-react';
 import { MigrationProgressEvent, MigrationRecord, MigrationRecordSizeEvent, MigrationResult } from '../types';
 import Toast, { useToast } from '../components/Toast';
@@ -23,7 +23,10 @@ import {
   buildLockWarningPrompt,
   formatMigrationFailureMessage,
   parseLockWarning,
+  parseTargetEmptyConfirm,
 } from '../utils/migrationMessages';
+import { buildEmptyTargetWarning, buildRestoreConfirm, restoreActionHint } from '../utils/restoreMode';
+import { useRestoreMode } from '../hooks/useRestoreMode';
 
 // no_data: 原路径已消失且目标为空/不存在，通常表示应用已被外部卸载。
 // broken_fixable: 链接失效但可修复——原路径存在真实目录（应用更新重建）或目标仍有数据，可重新迁移/恢复
@@ -110,7 +113,7 @@ function setCachedStatus(id: string, status: LinkStatus) {
 }
 
 function HistoryRow({
-  record, onRestore, isRestoring, restoreProgress, linkStatus, onCleanup, onRemigrate, onOpenPath, onContextMenu,
+  record, onRestore, isRestoring, restoreProgress, linkStatus, onCleanup, onRemigrate, onOpenPath, onContextMenu, onDeleteRecord,
 }: {
   record: MigrationRecord;
   onRestore: (id: string, recordType: string) => void;
@@ -123,8 +126,14 @@ function HistoryRow({
   onOpenPath: (path: string) => void;
   /** 右键菜单：交由页面统一用固定定位渲染 */
   onContextMenu?: (record: MigrationRecord, position: { x: number; y: number }) => void;
+  /** 删除记录本身（保留目标数据），用于保留模式还原后的记录 */
+  onDeleteRecord?: (record: MigrationRecord) => void;
 }) {
+  // 仅链接模式下这个按钮实际只修链，不搬数据，文案随之变化
+  const restoreMode = useRestoreMode();
   const isLargeFolder = record.record_type === 'LargeFolder';
+  // 保留模式还原过：目标副本仍在，可以再次还原
+  const keptRestored = record.status !== 'active' && record.target_kept;
   const [expanded, setExpanded] = useState(false);
 
   const rowStyle: React.CSSProperties = {
@@ -199,10 +208,18 @@ function HistoryRow({
         </div>
 
         {/* status */}
-        <div className="flex-shrink-0 w-5 flex justify-center" title={linkStatus === 'healthy' ? '正常' : linkStatus === 'broken_fixable' ? '链接失效，可重新迁移修复' : linkStatus === 'broken_lost' ? '数据已丢失，只能清理' : linkStatus === 'no_data' ? '应用已卸载，没有可恢复的数据' : ''}>
-          {linkStatus === 'checking' && <Loader2 className="w-3.5 h-3.5 animate-spin" style={{ color: 'var(--text-tertiary)' }} />}
-          {linkStatus === 'healthy' && <CheckCircle2 className="w-3.5 h-3.5" style={{ color: 'var(--color-success)' }} />}
-          {(linkStatus === 'broken_fixable' || linkStatus === 'broken_lost' || linkStatus === 'no_data') && <span title={linkStatus === 'no_data' ? '应用已卸载，没有可恢复的数据' : '链接失效，可重新迁移或清理'}><AlertTriangle className="w-3.5 h-3.5" style={{ color: linkStatus === 'broken_lost' || linkStatus === 'no_data' ? 'var(--color-danger)' : 'var(--color-warning)' }} /></span>}
+        <div className="flex-shrink-0 w-5 flex justify-center" title={keptRestored ? '已还原，目标副本保留，可再次还原' : linkStatus === 'healthy' ? '正常' : linkStatus === 'broken_fixable' ? '链接失效，可重新迁移修复' : linkStatus === 'broken_lost' ? '数据已丢失，只能清理' : linkStatus === 'no_data' ? '应用已卸载，没有可恢复的数据' : ''}>
+          {keptRestored ? (
+            <span title="已还原，目标副本保留，可再次还原">
+              <Archive className="w-3.5 h-3.5" style={{ color: 'var(--color-warning)' }} />
+            </span>
+          ) : (
+            <>
+              {linkStatus === 'checking' && <Loader2 className="w-3.5 h-3.5 animate-spin" style={{ color: 'var(--text-tertiary)' }} />}
+              {linkStatus === 'healthy' && <CheckCircle2 className="w-3.5 h-3.5" style={{ color: 'var(--color-success)' }} />}
+              {(linkStatus === 'broken_fixable' || linkStatus === 'broken_lost' || linkStatus === 'no_data') && <span title={linkStatus === 'no_data' ? '应用已卸载，没有可恢复的数据' : '链接失效，可重新迁移或清理'}><AlertTriangle className="w-3.5 h-3.5" style={{ color: linkStatus === 'broken_lost' || linkStatus === 'no_data' ? 'var(--color-danger)' : 'var(--color-warning)' }} /></span>}
+            </>
+          )}
         </div>
 
         {/* size */}
@@ -210,8 +227,38 @@ function HistoryRow({
           {formatSize(record.size)}
         </span>
 
-        {/* action: 可修复 → 重新迁移 + 清理, 数据丢失 → 清理, 正常 → 恢复 */}
-        {linkStatus === 'broken_fixable' ? (
+        {/* action: 保留副本 → 再次还原 + 删除记录；可修复 → 重新迁移 + 清理；数据丢失 → 清理；正常 → 恢复 */}
+        {keptRestored ? (
+          <>
+            <button
+              onClick={e => { e.stopPropagation(); onRestore(record.id, record.record_type || 'App'); }}
+              disabled={isRestoring}
+              className="btn btn-sm h-6 text-[11px] flex-shrink-0"
+              style={isRestoring ? {
+                background: `linear-gradient(to right, var(--color-primary-light) 0%, var(--color-primary-light) ${Math.round(restoreProgress ?? 0)}%, transparent ${Math.round(restoreProgress ?? 0)}%)`,
+                borderColor: 'var(--color-primary)',
+                color: 'var(--color-primary)',
+              } : {
+                color: 'var(--color-primary)',
+                borderColor: 'var(--color-primary)',
+              }}
+              title={`${restoreActionHint(restoreMode, record.target_path)}（原路径需为空或不存在）`}
+            >
+              {isRestoring ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
+              {isRestoring ? `${Math.round(restoreProgress ?? 0)}%` : (restoreMode === 'link_only' ? '修复链接' : '恢复')}
+            </button>
+            <button
+              onClick={e => { e.stopPropagation(); onDeleteRecord?.(record); }}
+              disabled={isRestoring}
+              className="btn btn-sm h-6 text-[11px] flex-shrink-0"
+              style={{ color: 'var(--text-secondary)', borderColor: 'var(--border-color)' }}
+              title="只删除这条记录，目标副本数据保留"
+            >
+              <Trash2 className="w-3 h-3" />
+              删除记录
+            </button>
+          </>
+        ) : linkStatus === 'broken_fixable' ? (
           <>
             <button
               onClick={e => { e.stopPropagation(); onRemigrate?.(record.id); }}
@@ -264,11 +311,13 @@ function HistoryRow({
               borderColor: 'var(--color-primary)',
               color: 'var(--color-primary)',
             } : undefined}
-            title={linkStatus === 'checking' ? '检测中…' : '恢复'}
+            title={linkStatus === 'checking' ? '检测中…' : restoreActionHint(restoreMode, record.target_path)}
           >
             {isRestoring ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />}
             {/* 恢复中展示后端百分比，避免历史页只能看到 loading。 */}
-            {isRestoring ? `${Math.round(restoreProgress ?? 0)}%` : '恢复'}
+            {isRestoring
+              ? `${Math.round(restoreProgress ?? 0)}%`
+              : (restoreMode === 'link_only' ? '修复链接' : '恢复')}
           </button>
         )}
 
@@ -348,6 +397,12 @@ function HistoryRow({
             <span style={{ color: 'var(--text-tertiary)' }}>大小</span>
             <p style={{ color: 'var(--text-primary)' }}>{formatSize(record.size)}</p>
           </div>
+          {record.status !== 'active' && record.target_kept && (
+            <div>
+              <span style={{ color: 'var(--text-tertiary)' }}>目标副本</span>
+              <p style={{ color: 'var(--color-warning)' }}>已按保留模式留在原处</p>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -355,6 +410,8 @@ function HistoryRow({
 }
 
 export default function MigrationHistory({ visible: _visible }: { visible: boolean }) {
+  // 当前还原模式：仅链接模式下「恢复」实际是「修复链接」
+  const restoreMode = useRestoreMode();
   const storeApi = useViapStore;
   const [records, setRecords] = useState<MigrationRecord[]>(() => storeApi.getState().historyRecords);
   const [loading, setLoading] = useState(true);
@@ -572,6 +629,18 @@ export default function MigrationHistory({ visible: _visible }: { visible: boole
 
   async function handleRestore(historyId: string, _recordType: string) {
     const record = records.find(item => item.id === historyId);
+
+    // 按当前模式提示将要执行的动作（模式由顶部菜单统一配置）
+    const subject = record ? `「${record.app_name}」` : '所选记录';
+    const copy = buildRestoreConfirm(restoreMode, subject, '恢复');
+    const confirmed = await confirm(copy.message, {
+      title: copy.title,
+      kind: 'info',
+      okLabel: copy.okLabel,
+      cancelLabel: '取消',
+    });
+    if (!confirmed) return;
+
     let unlisten: UnlistenFn | null = null;
     try {
       setRestoringId(historyId);
@@ -589,10 +658,32 @@ export default function MigrationHistory({ visible: _visible }: { visible: boole
       }
       // 统一使用 restore_app，后端根据 record_type 自动分发恢复逻辑
       // 避免 restore_large_folder 不更新 history 状态导致记录残留的问题
-      const result = await invoke<MigrationResult>('restore_app', { historyId });
+      let result = await invoke<MigrationResult>('restore_app', { historyId });
+
+      // 目标目录为空时不再静默拒绝：先告知后果，再由用户选择继续或取消
+      const emptyTarget = parseTargetEmptyConfirm(result.message);
+      if (!result.success && emptyTarget) {
+        const proceed = await confirm(buildEmptyTargetWarning(restoreMode, emptyTarget), {
+          title: '目标目录为空',
+          kind: 'warning',
+          okLabel: '继续还原',
+          cancelLabel: '取消',
+        });
+        if (!proceed) {
+          showToast('已取消：目标目录为空，未做任何改动', 'info');
+          return;
+        }
+        result = await invoke<MigrationResult>('restore_app', {
+          historyId,
+          forceEmptyContinue: true,
+        });
+      }
 
       if (result.success) {
-        showToast('已成功恢复', 'success');
+        showToast(
+          restoreMode === 'link_only' ? '目录链接已就绪，数据仍在目标盘' : '已成功恢复',
+          'success',
+        );
         // 清除该条记录的健康状态缓存，避免缓存过期前显示旧状态
         setCachedStatus(historyId, 'unknown' as LinkStatus);
         await loadHistory();
@@ -609,7 +700,7 @@ export default function MigrationHistory({ visible: _visible }: { visible: boole
         }
       }
     } catch (error) {
-      showToast(`恢复失败: ${error}`, 'error');
+      showToast(`${restoreMode === 'link_only' ? '修复链接失败' : '恢复失败'}: ${error}`, 'error');
     } finally {
       if (unlisten) unlisten();
       setRestoreProgressMap(prev => {
@@ -685,7 +776,13 @@ export default function MigrationHistory({ visible: _visible }: { visible: boole
   const totalSize = records.reduce((sum, r) => sum + r.size, 0);
   // 体积为 0 的活跃记录只可能来自重建，据此提供「补全大小」入口
   const missingSizeCount = records.filter(record => record.status === 'active' && record.size === 0).length;
-  const brokenCount = Object.values(linkStatuses).filter(s => s === 'broken_fixable' || s === 'broken_lost').length;
+  // 保留模式还原过的记录本就不是"链接损坏"，不计入需要处理的条数
+  const brokenCount = records
+    .filter(record => !(record.status !== 'active' && record.target_kept))
+    .filter(record => {
+      const status = linkStatuses[record.id];
+      return status === 'broken_fixable' || status === 'broken_lost';
+    }).length;
 
   const filteredRecords = useMemo(() => {
     let result = [...records];
@@ -861,6 +958,7 @@ export default function MigrationHistory({ visible: _visible }: { visible: boole
                   onCleanup={handleCleanupBroken}
                   onRemigrate={handleRemigrate}
                   onOpenPath={handleOpenPath}
+                  onDeleteRecord={(record) => setDeleteTarget(record)}
                   onContextMenu={(record, position) => setRowMenu({ record, ...position })} />
               ))
             )}

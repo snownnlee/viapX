@@ -3,6 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { normalizeFontSizePx } from './fontSize';
+import { DEFAULT_RESTORE_MODE, normalizeRestoreMode, type RestoreMode } from './restoreMode';
 
 export type UserThemeMode = 'light' | 'dark' | 'system';
 
@@ -19,6 +20,8 @@ export interface UserSettings {
   skipLockCheck: boolean;
   /** 启用液态玻璃外观；默认关闭，开启后整窗切换为半透明玻璃风格 */
   glassEnabled: boolean;
+  /** 还原模式：仅链接 / 保留 / 移动，决定还原时如何处置原路径与目标数据 */
+  restoreMode: RestoreMode;
 }
 
 interface UserSettingsLoadResult {
@@ -39,6 +42,7 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   autoBackupEnabled: true,
   skipLockCheck: false,
   glassEnabled: false,
+  restoreMode: DEFAULT_RESTORE_MODE,
 };
 
 function isThemeMode(value: unknown): value is UserThemeMode {
@@ -69,6 +73,8 @@ export function normalizeUserSettings(input: Partial<UserSettings>): UserSetting
     skipLockCheck: input.skipLockCheck === true,
     // 旧配置文件里没有该字段，缺省即关闭，确保升级后外观与原来完全一致
     glassEnabled: input.glassEnabled === true,
+    // 旧配置缺省为仅链接模式；未知值一并回退，避免还原行为不确定
+    restoreMode: normalizeRestoreMode(input.restoreMode),
   };
 }
 

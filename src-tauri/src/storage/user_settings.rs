@@ -20,6 +20,10 @@ fn default_theme() -> String {
     "system".to_string()
 }
 
+fn default_restore_mode() -> String {
+    crate::models::RestoreMode::DEFAULT_KEY.to_string()
+}
+
 fn default_font_size() -> u8 {
     13
 }
@@ -48,6 +52,9 @@ pub struct UserSettings {
     /// 启用液态玻璃外观；默认关闭，开启后整窗切换为半透明玻璃风格
     #[serde(default)]
     pub glass_enabled: bool,
+    /// 还原模式：link_only（仅修链接）/ keep_data（保留目标副本）/ move（移动回原路径）
+    #[serde(default = "default_restore_mode")]
+    pub restore_mode: String,
     /// 窗口宽度（逻辑像素，随窗口拖动单独保存）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_width: Option<u32>,
@@ -89,6 +96,7 @@ impl Default for UserSettings {
             auto_backup_enabled: true,
             skip_lock_check: false,
             glass_enabled: false,
+            restore_mode: default_restore_mode(),
             window_width: None,
             window_height: None,
         }
@@ -102,7 +110,17 @@ impl UserSettings {
         if !matches!(self.theme.as_str(), "light" | "dark" | "system") {
             self.theme = default_theme();
         }
+        // 未知的还原模式（手改配置或降级）一律回退默认值，避免还原时行为未定义
+        self.restore_mode = crate::models::RestoreMode::parse(&self.restore_mode)
+            .unwrap_or_default()
+            .as_key()
+            .to_string();
         self
+    }
+
+    /// 当前还原模式（已规范化）
+    pub(crate) fn restore_mode(&self) -> crate::models::RestoreMode {
+        crate::models::RestoreMode::parse(&self.restore_mode).unwrap_or_default()
     }
 }
 

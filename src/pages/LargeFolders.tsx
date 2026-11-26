@@ -24,12 +24,16 @@ import {
   buildLockWarningPrompt,
   formatMigrationFailureMessage,
   parseLockWarning,
+  parseTargetEmptyConfirm,
   parseTargetExistsConflict,
 } from '../utils/migrationMessages';
+import { buildEmptyTargetWarning, buildRestoreConfirm, restoreActionHint } from '../utils/restoreMode';
+import { useRestoreMode } from '../hooks/useRestoreMode';
 import {
   buildBatchConfirmMessage, getAvailableSpaceForPath, type BatchReportItem,
 } from '../utils/batchMigration';
 import {
+  KeptRestoreInfo,
   LargeFolder, ProcessLockResult, LargeFolderSizeEvent,
   MigrationProgressEvent,
   MigrationResult, MigrationStep, TabType,
@@ -208,7 +212,7 @@ function FolderRow({
   folder, onMigrate, onRestore, onOpenFolder, onRemove,
   isMigrating, isRestoring,
   restoreProgress,
-  showCheckbox, isSelected, onToggleSelect,
+  showCheckbox, isSelected, onToggleSelect, keptRestore,
 }: {
   folder: LargeFolder;
   onMigrate: (f: LargeFolder) => void;
@@ -221,7 +225,11 @@ function FolderRow({
   showCheckbox?: boolean;
   isSelected?: boolean;
   onToggleSelect?: (f: LargeFolder) => void;
+  /** 保留模式还原后仍保留的目标副本：即使原路径不再是链接也能再次恢复 */
+  keptRestore?: KeptRestoreInfo;
 }) {
+  // 仅链接模式下这个按钮实际只修链，不搬数据，文案随之变化
+  const restoreMode = useRestoreMode();
   const notFound = !folder.exists;
   const isSystem = folder.folder_type === 'System';
   const isCustom = folder.folder_type === 'Custom';
@@ -308,22 +316,33 @@ function FolderRow({
 
         {notFound ? (
           <span className="text-[11px] mr-2" style={{ color: 'var(--text-tertiary)' }}>不可用</span>
-        ) : folder.is_junction ? (
-          <button
-            onClick={() => onRestore(folder)}
-            disabled={isRestoring}
-            className="btn btn-sm h-6 text-[11px]"
-            style={isRestoring ? {
-              // 行内按钮绘制恢复进度，避免另加列导致表格抖动。
-              background: `linear-gradient(to right, var(--color-primary-light) 0%, var(--color-primary-light) ${Math.round(restoreProgress ?? 0)}%, transparent ${Math.round(restoreProgress ?? 0)}%)`,
-              borderColor: 'var(--color-primary)',
-              color: 'var(--color-primary)',
-            } : undefined}
-          >
-            {isRestoring ? <Loader2 className="w-3 h-3 animate-spin" /> : <Undo2 className="w-3 h-3" />}
-            {/* 恢复过程展示后端百分比，让大目录恢复时不再只有 loading。 */}
-            {isRestoring ? `${Math.round(restoreProgress ?? 0)}%` : '恢复'}
-          </button>
+        ) : (folder.is_junction || keptRestore) ? (
+          <>
+            <button
+              onClick={() => onRestore(folder)}
+              disabled={isRestoring}
+              title={keptRestore && !folder.is_junction
+                ? `${restoreActionHint(restoreMode, keptRestore.target_path)}（原路径需为空或不存在）`
+                : restoreActionHint(restoreMode, folder.path)}
+              className="btn btn-sm h-6 text-[11px]"
+              style={isRestoring ? {
+                // 行内按钮绘制恢复进度，避免另加列导致表格抖动。
+                background: `linear-gradient(to right, var(--color-primary-light) 0%, var(--color-primary-light) ${Math.round(restoreProgress ?? 0)}%, transparent ${Math.round(restoreProgress ?? 0)}%)`,
+                borderColor: 'var(--color-primary)',
+                color: 'var(--color-primary)',
+              } : undefined}
+            >
+              {isRestoring ? <Loader2 className="w-3 h-3 animate-spin" /> : <Undo2 className="w-3 h-3" />}
+              {/* 恢复过程展示后端百分比，让大目录恢复时不再只有 loading。 */}
+              {isRestoring ? `${Math.round(restoreProgress ?? 0)}%` : (restoreMode === 'link_only' ? '修复链接' : '恢复')}
+            </button>
+            {keptRestore && !folder.is_junction && (
+              <button onClick={() => onMigrate(folder)} disabled={isMigrating} className="btn btn-primary btn-sm h-6 text-[11px]">
+                {isMigrating ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
+                {isMigrating ? '迁移中' : '迁移'}
+              </button>
+            )}
+          </>
         ) : (
           <button onClick={() => onMigrate(folder)} disabled={isMigrating} className="btn btn-primary btn-sm h-6 text-[11px]">
             {isMigrating ? <Loader2 className="w-3 h-3 animate-spin" /> : null}
@@ -341,6 +360,8 @@ function FolderRow({
  * 返回错误消息字符串，或 null 表示安全
  */
 export default function LargeFolders({ visible }: { visible: boolean }) {
+  // 当前还原模式：仅链接模式下「恢复」实际是「修复链接」
+  const restoreMode = useRestoreMode();
   const storeApi = useViapStore;
   const [folders, setFolders] = useState<LargeFolder[]>(() => storeApi.getState().largeFolders);
   const [loading, setLoading] = useState(true);
@@ -351,6 +372,15 @@ export default function LargeFolders({ visible }: { visible: boolean }) {
   const appDataScanTokenRef = useRef<string | null>(null);
   const [restoringFolderId, setRestoringFolderId] = useState<string | null>(null);
   const [restoreProgressMap, setRestoreProgressMap] = useState<Record<string, number>>({});
+  // 保留模式还原后仍保留副本的条目：让"已还原但副本还在"的文件夹继续显示「恢复」
+  const [keptRestores, setKeptRestores] = useState<KeptRestoreInfo[]>([]);
+  const keptRestoreByPath = useMemo(() => {
+    const map = new Map<string, KeptRestoreInfo>();
+    for (const item of keptRestores) {
+      map.set(item.original_path.toLowerCase(), item);
+    }
+    return map;
+  }, [keptRestores]);
 
   // 迁移进度弹窗状态
   const [migrationModalOpen, setMigrationModalOpen] = useState(false);
@@ -450,8 +480,13 @@ export default function LargeFolders({ visible }: { visible: boolean }) {
       appDataScanIdsRef.current = new Set();
       appDataCompletedIdsRef.current = new Set();
       appDataScanTokenRef.current = null;
-      const result = await invoke<LargeFolder[]>('get_large_folders');
+      const [result, kept] = await Promise.all([
+        invoke<LargeFolder[]>('get_large_folders'),
+        // 保留副本记录与文件夹列表同时拉取，避免先渲染出错误按钮再闪一下
+        invoke<KeptRestoreInfo[]>('list_kept_restores').catch(() => [] as KeptRestoreInfo[]),
+      ]);
       setFolders(result);
+      setKeptRestores(kept);
       storeApi.setState({ largeFolders: result, largeFoldersLoaded: true });
       storeApi.getState().setLargeFoldersAppDataLoaded(false);
       // 在前端监听器就绪后启动大小扫描，避免竞态导致事件丢失
@@ -1021,6 +1056,28 @@ export default function LargeFolders({ visible }: { visible: boolean }) {
         }
       } catch { /* non-critical */ }
     }
+    // 按当前模式提示将要执行的动作（模式由顶部菜单统一配置）
+    const copy = buildRestoreConfirm(restoreMode, `文件夹「${folder.display_name}」`, '恢复');
+    const confirmed = await confirm(copy.message, {
+      title: copy.title,
+      kind: 'info',
+      okLabel: copy.okLabel,
+      cancelLabel: '取消',
+    });
+    if (!confirmed) return;
+
+    // 保留副本场景：原路径已不是链接，按记录 ID 走统一还原入口（后端会分发到大文件夹恢复）
+    const kept = folder.is_junction ? undefined : keptRestoreByPath.get(folder.path.toLowerCase());
+    const invokeRestore = (forceEmpty: boolean) => (kept
+      ? invoke<MigrationResult>('restore_app', {
+        historyId: kept.history_id,
+        forceEmptyContinue: forceEmpty,
+      })
+      : invoke<MigrationResult>('restore_large_folder', {
+        junctionPath: folder.path,
+        forceEmptyContinue: forceEmpty,
+      }));
+
     setRestoringFolderId(folder.id);
     setRestoreProgressMap(prev => ({ ...prev, [folder.id]: 0 }));
     let unlisten: UnlistenFn | null = null;
@@ -1034,15 +1091,37 @@ export default function LargeFolders({ visible }: { visible: boolean }) {
           }
         });
       } catch { /* 监听失败不阻断恢复，按钮会保持 0% */ }
-      const result = await invoke<MigrationResult>('restore_large_folder', { junctionPath: folder.path });
+      let result = await invokeRestore(false);
+
+      // 目标目录为空时不再静默拒绝：先告知后果，再由用户选择继续或取消
+      const emptyTarget = parseTargetEmptyConfirm(result.message);
+      if (!result.success && emptyTarget) {
+        const proceed = await confirm(buildEmptyTargetWarning(restoreMode, emptyTarget), {
+          title: '目标目录为空',
+          kind: 'warning',
+          okLabel: '继续恢复',
+          cancelLabel: '取消',
+        });
+        if (!proceed) {
+          showToast('已取消：目标目录为空，未做任何改动', 'info');
+          return;
+        }
+        result = await invokeRestore(true);
+      }
+
       if (result.success) {
-        showToast(result.message, 'success');
+        showToast(
+          restoreMode === 'link_only'
+            ? `${folder.display_name} 的目录链接已就绪，数据仍在目标盘`
+            : result.message,
+          'success',
+        );
         await fetchFolders();
       } else {
         showToast(result.message, 'error');
       }
     } catch (error) {
-      showToast(`恢复失败: ${error}`, 'error');
+      showToast(`${restoreMode === 'link_only' ? '修复链接失败' : '恢复失败'}: ${error}`, 'error');
     } finally {
       if (unlisten) unlisten();
       setRestoreProgressMap(prev => {
@@ -1181,6 +1260,7 @@ export default function LargeFolders({ visible }: { visible: boolean }) {
                       <FolderRow key={f.id} folder={f} onMigrate={handleMigrate} onRestore={handleRestore}
                         onOpenFolder={openFolder} isMigrating={migratingFolder?.id === f.id} isRestoring={restoringFolderId === f.id}
                         restoreProgress={restoreProgressMap[f.id]}
+                        keptRestore={keptRestoreByPath.get(f.path.toLowerCase())}
                         showCheckbox isSelected={selectedKeys.has(f.id)} onToggleSelect={handleToggleSelect} />
                     ))}
                   </section>
@@ -1226,6 +1306,7 @@ export default function LargeFolders({ visible }: { visible: boolean }) {
                         <FolderRow key={f.id} folder={f} onMigrate={handleMigrate} onRestore={handleRestore}
                           onOpenFolder={openFolder} isMigrating={migratingFolder?.id === f.id} isRestoring={restoringFolderId === f.id}
                           restoreProgress={restoreProgressMap[f.id]}
+                          keptRestore={keptRestoreByPath.get(f.path.toLowerCase())}
                           showCheckbox isSelected={selectedKeys.has(f.id)} onToggleSelect={handleToggleSelect} />
                       )}
                     />
@@ -1242,6 +1323,7 @@ export default function LargeFolders({ visible }: { visible: boolean }) {
                         onOpenFolder={openFolder} onRemove={handleRemoveCustomFolder}
                         isMigrating={migratingFolder?.id === f.id} isRestoring={restoringFolderId === f.id}
                         restoreProgress={restoreProgressMap[f.id]}
+                        keptRestore={keptRestoreByPath.get(f.path.toLowerCase())}
                         showCheckbox isSelected={selectedKeys.has(f.id)} onToggleSelect={handleToggleSelect} />
                     ))}
                   </section>

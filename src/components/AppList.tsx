@@ -3,11 +3,14 @@
 
 import { Package, Search, X, Link2, Check, ArrowRightLeft, FolderOpen, RotateCw, LoaderCircle, ArrowUpDown, ArrowUp, ArrowDown, ShieldCheck, ShieldOff } from 'lucide-react';
 import { InstalledApp } from '../types';
-import { useState, useMemo, useDeferredValue, memo, useEffect } from 'react';
+import { useState, useMemo, useDeferredValue, memo, useEffect, useCallback } from 'react';
 import FilterSelect from './FilterSelect';
 import EmptyState from './EmptyState';
 import { useViapStore } from '../store';
 import { useDangerousPathCheck } from '../hooks/useDangerousPathCheck';
+import { useRestoreMode } from '../hooks/useRestoreMode';
+import { restoreActionHint, restoreActionLabel } from '../utils/restoreMode';
+import { findMigratedParent, type MigratedParent } from '../utils/migratedParent';
 
 type MigrationFilter = 'all' | 'migrated' | 'not_migrated';
 type DriveFilter = 'all' | 'c' | 'other';
@@ -32,6 +35,11 @@ interface AppListProps {
   restoringKey?: string | null;
   restoreProgressMap?: Record<string, number>;
   migratedPaths?: string[];
+  /** 保留模式还原后仍保留副本的路径 → 副本路径（小写原路径为 key） */
+  keptRestoreTargets?: Record<string, string>;
+  /** 已迁移的上级目录：应用位于其中时不能单独迁移/还原 */
+  migratedParents?: MigratedParent[];
+  onOpenMigratedParent?: (parent: MigratedParent) => void;
   selectedKeys?: Set<string>;
   onToggleSelect?: (app: InstalledApp) => void;
   onSelectAll?: () => void;
@@ -124,7 +132,8 @@ const AppRow = memo(function AppRow({
   isUninstalling, isMigrated, isRestoring,
   restoreProgress,
   isSelected, onToggleSelect, showCheckbox,
-  appSize, isViap, iconsLoading, operationsLocked,
+  appSize, isViap, iconsLoading, operationsLocked, keptRestoreTarget,
+  parentMigration, onOpenMigratedParent,
 }: {
   app: InstalledApp;
   onMigrate: (app: InstalledApp) => void;
@@ -133,6 +142,11 @@ const AppRow = memo(function AppRow({
   onOpenFolder: (app: InstalledApp) => void;
   isUninstalling: boolean;
   isMigrated: boolean;
+  /** 保留模式还原后副本仍在：即使当前不在迁移状态也能再次还原 */
+  keptRestoreTarget?: string;
+  /** 应用位于已迁移的上级目录内：不能单独迁移/还原 */
+  parentMigration?: MigratedParent;
+  onOpenMigratedParent?: (parent: MigratedParent) => void;
   isRestoring: boolean;
   restoreProgress?: number;
   isSelected?: boolean;
@@ -143,6 +157,8 @@ const AppRow = memo(function AppRow({
   iconsLoading?: boolean;
   operationsLocked: boolean;
 }) {
+  // 仅链接模式下这个按钮实际只修链，不搬数据，文案随之变化
+  const restoreMode = useRestoreMode();
   const rowStyle: React.CSSProperties = {
     height: 'var(--row-height)' as unknown as string,
     padding: '0 8px',
@@ -170,7 +186,7 @@ const AppRow = memo(function AppRow({
       }}
     >
       {/* checkbox */}
-      {showCheckbox && !isMigrated && !isViap && (
+      {showCheckbox && !isMigrated && !isViap && !parentMigration && (
         <button
           onClick={(e) => { e.stopPropagation(); onToggleSelect?.(app); }}
           disabled={operationsLocked}
@@ -187,10 +203,10 @@ const AppRow = memo(function AppRow({
           {isSelected && <Check className="w-3 h-3 text-white" strokeWidth={3} />}
         </button>
       )}
-      {(showCheckbox && (isMigrated || isViap)) && <div className="flex-shrink-0 w-4 h-4" />}
+      {(showCheckbox && (isMigrated || isViap || parentMigration)) && <div className="flex-shrink-0 w-4 h-4" />}
 
-      {/* left bar for migrated */}
-      {isMigrated && (
+      {/* left bar for migrated（含随父目录迁移） */}
+      {(isMigrated || parentMigration) && (
         <div
           className="absolute left-0 top-0 bottom-0 w-0.5"
           style={{ background: 'var(--color-primary)' }}
@@ -213,6 +229,15 @@ const AppRow = memo(function AppRow({
             <span className="badge badge-success flex-shrink-0">
               <Link2 className="w-2.5 h-2.5" />
               已迁移
+            </span>
+          )}
+          {!isMigrated && parentMigration && (
+            <span
+              className="badge badge-success flex-shrink-0"
+              title={`位于已迁移目录「${parentMigration.appName}」内，数据在 ${parentMigration.targetPath}`}
+            >
+              <Link2 className="w-2.5 h-2.5" />
+              已迁移（随父目录）
             </span>
           )}
         </div>
@@ -249,10 +274,14 @@ const AppRow = memo(function AppRow({
           <FolderOpen className="w-3.5 h-3.5" />
         </button>
 
-        {isMigrated ? (
+        {isMigrated || keptRestoreTarget ? (
+          <>
           <button
             onClick={() => onRestore(app)}
             disabled={operationsLocked || isRestoring}
+            title={isMigrated
+              ? restoreActionHint(restoreMode)
+              : `${restoreActionHint(restoreMode, keptRestoreTarget)}（原路径需为空或不存在）`}
             className="btn btn-sm h-6 text-[11px]"
             style={isRestoring ? {
               // 直接在按钮背景绘制进度条，列表行无需额外占用空间。
@@ -262,7 +291,28 @@ const AppRow = memo(function AppRow({
             } : undefined}
           >
             {/* 恢复过程由后端推送百分比，按钮内直接展示，避免只显示 loading。 */}
-            {isRestoring ? `${Math.round(restoreProgress ?? 0)}%` : '还原'}
+            {isRestoring ? `${Math.round(restoreProgress ?? 0)}%` : restoreActionLabel(restoreMode)}
+          </button>
+          {/* 已还原但副本仍在：迁移仍然可用，给回原入口 */}
+          {keptRestoreTarget && !isMigrated && (
+            <button
+              onClick={() => onMigrate(app)}
+              disabled={operationsLocked || isViap}
+              className="btn btn-primary btn-sm h-6 text-[11px]"
+            >
+              迁移
+            </button>
+          )}
+          </>
+        ) : parentMigration ? (
+          <button
+            onClick={() => onOpenMigratedParent?.(parentMigration)}
+            disabled={operationsLocked}
+            className="btn btn-sm h-6 text-[11px]"
+            title={`位于已迁移目录「${parentMigration.appName}」内，无法单独迁移或还原；点击前往数据迁移页处理该目录`}
+          >
+            <Link2 className="w-3 h-3" />
+            查看迁移目录
           </button>
         ) : (
           <button
@@ -320,6 +370,9 @@ function LoadingSkeleton() {
 export default function AppList({
   apps, loading, onMigrate, onRestore, onUninstall, onOpenFolder,
   uninstallingKey = null, restoringKey = null, migratedPaths = [],
+  keptRestoreTargets = {},
+  migratedParents = [],
+  onOpenMigratedParent,
   restoreProgressMap = {},
   selectedKeys, onToggleSelect, onSelectAll, onBatchMigrate,
   onStopBatchMigrate,
@@ -375,6 +428,12 @@ export default function AppList({
 
   const isAppMigrated = (app: InstalledApp): boolean =>
     migratedPathSet.has(app.install_location.toLowerCase());
+
+  // 应用自身没有迁移记录、但位于被迁移的上级目录里：不能单独迁移，也不能单独还原
+  const parentOf = useCallback(
+    (app: InstalledApp) => findMigratedParent(app.install_location, migratedParents),
+    [migratedParents],
+  );
 
   const isViapSelfApp = (app: InstalledApp): boolean =>
     viapInstallPath
@@ -467,8 +526,8 @@ export default function AppList({
   ];
 
   const selectableCount = useMemo(
-    () => filteredApps.filter(a => !isAppMigrated(a) && !isViapSelfApp(a)).length,
-    [filteredApps, migratedPathSet, viapInstallPath],
+    () => filteredApps.filter(a => !isAppMigrated(a) && !isViapSelfApp(a) && !parentOf(a)).length,
+    [filteredApps, migratedPathSet, viapInstallPath, parentOf],
   );
 
   const driveOptions: { value: DriveFilter; label: string }[] = [
@@ -723,6 +782,9 @@ export default function AppList({
                     isRestoring={restoringKey === `${app.display_name}|${app.registry_path}`}
                     restoreProgress={restoreProgressMap[`${app.display_name}|${app.registry_path}`]}
                     isMigrated={isAppMigrated(app)}
+                    keptRestoreTarget={keptRestoreTargets[app.install_location.toLowerCase()]}
+                    parentMigration={parentOf(app)}
+                    onOpenMigratedParent={onOpenMigratedParent}
                     isSelected={selectedKeys?.has(key)}
                     onToggleSelect={onToggleSelect}
                     showCheckbox={!!onToggleSelect}

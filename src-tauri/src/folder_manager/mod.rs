@@ -350,11 +350,13 @@ pub fn remove_custom_folder(id: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn restore_large_folder(
     junction_path: String,
+    force_empty_continue: Option<bool>,
     app_handle: AppHandle,
 ) -> Result<MigrationResult, String> {
     #[cfg(windows)]
     {
         let junction = PathBuf::from(&junction_path);
+        let force_empty = force_empty_continue.unwrap_or(false);
 
         if !utils::is_junction(&junction) {
             return Err("该路径不是一个符号链接，无法恢复".to_string());
@@ -368,11 +370,13 @@ pub async fn restore_large_folder(
         if !target_path.exists() {
             return Err(format!("目标路径不存在: {}", target_path.to_string_lossy()));
         }
-        if crate::storage::history::is_empty_directory(&target_path)? {
+        // 空目标目录不再直接拒绝：交回前端提示，由用户决定继续还是取消
+        if crate::storage::history::is_empty_directory(&target_path)? && !force_empty {
             return Ok(MigrationResult {
                 success: false,
                 message: format!(
-                    "目标目录为空，没有可恢复的数据：{}\n\n未创建原目录，请先确认该文件夹是否已被卸载或手动清理。",
+                    "{}{}",
+                    crate::storage::history::TARGET_EMPTY_CONFIRM_PREFIX,
                     target_path.display()
                 ),
                 new_path: None,
@@ -399,7 +403,10 @@ pub async fn restore_large_folder(
     }
 
     #[cfg(not(windows))]
-    { Err("此功能仅支持 Windows 系统".to_string()) }
+    {
+        let _ = (&junction_path, &force_empty_continue, &app_handle);
+        Err("此功能仅支持 Windows 系统".to_string())
+    }
 }
 
 /// 恢复大文件夹的内部逻辑（在后台线程中执行）
@@ -409,6 +416,7 @@ fn restore_large_folder_inner(
     app_handle: &AppHandle,
 ) -> Result<MigrationResult, String> {
     let target_path = PathBuf::from(target_str);
+    let mode = crate::storage::user_settings::load_current_settings().restore_mode();
 
     let restore_result = crate::migration::restore_directory_with_progress(
         junction_path,
@@ -417,28 +425,44 @@ fn restore_large_folder_inner(
         app_handle,
         // 用户文件夹恢复不补沙箱读取权限，避免把权限扩散到文档/下载这类目录
         false,
+        mode,
     )?;
 
     // 步骤 4: 更新迁移记录状态
+    // 仅链接模式只修链，数据仍在目标盘，记录保持 active 才能继续被识别为已迁移
     let junction_str = junction_path.to_string_lossy().to_string();
-    if let Err(e) = crate::storage::history::update_migration_record_status(&junction_str, "restored") {
-        eprintln!("警告: 更新迁移记录状态失败: {}", e);
+    if !restore_result.action.is_link_only() {
+        if let Err(e) = crate::storage::history::update_migration_record_status(
+            &junction_str,
+            "restored",
+            restore_result.target_kept,
+        ) {
+            log_warn!("folder_manager", "更新迁移记录状态失败: {}", e);
+        }
     }
 
-    let mut message = format!(
-        "恢复成功！文件夹已从 {} 移回 {}（{}）",
+    let folder_name = junction_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| junction_str.clone());
+    let message = crate::migration::build_restore_message(
+        &format!("文件夹 {}", folder_name),
+        &junction_str,
         target_str,
-        junction_str,
-        crate::migration::format_bytes(restore_result.restored_size)
+        mode,
+        restore_result.action,
+        restore_result.restored_size,
+        restore_result.cleanup_warning.as_deref(),
     );
-    if let Some(warning) = restore_result.cleanup_warning {
-        message.push_str(&format!("\n\n{}", warning));
-    }
 
     Ok(MigrationResult {
         success: true,
         message,
-        new_path: Some(junction_str),
+        new_path: if restore_result.action.is_link_only() {
+            None
+        } else {
+            Some(junction_str)
+        },
     })
 }
 
@@ -449,13 +473,22 @@ pub fn restore_large_folder_by_history(
     history_id: String,
     record: crate::models::MigrationRecord,
     app_handle: AppHandle,
+    force_empty_continue: bool,
 ) -> Result<MigrationResult, String> {
     #[cfg(windows)]
     {
         let junction_path = std::path::PathBuf::from(&record.original_path);
         let target_path = std::path::PathBuf::from(&record.target_path);
+        // 还原模式由顶部菜单的全局设置决定
+        let mode = crate::storage::user_settings::load_current_settings().restore_mode();
 
-        if !utils::is_junction(&junction_path) {
+        // 仅链接模式允许原路径不是链接（缺失时补建、指向错误时重建），其余模式必须先有链接；
+        // 原路径已不存在且用户已确认"目标为空仍继续"时属于空目录还原，不再要求链接
+        let original_missing = !junction_path.exists();
+        if mode != crate::models::RestoreMode::LinkOnly
+            && !utils::is_junction(&junction_path)
+            && !(force_empty_continue && original_missing)
+        {
             return Ok(MigrationResult {
                 success: false,
                 message: format!(
@@ -473,19 +506,40 @@ pub fn restore_large_folder_by_history(
                 new_path: None,
             });
         }
-        if crate::storage::history::is_empty_directory(&target_path)? {
+        // 保留模式还原过的记录再次恢复：原路径已是真实目录时先说清原因，
+        // 比"目标为空/不是联接"更能解释用户看到的现象
+        if mode != crate::models::RestoreMode::LinkOnly
+            && record.status == "restored"
+            && record.target_kept
+            && junction_path.exists()
+            && !utils::is_junction(&junction_path)
+        {
             return Ok(MigrationResult {
                 success: false,
                 message: format!(
-                    "目标目录为空，没有可恢复的数据：{}\n\n未创建原目录，请先确认该文件夹是否已被卸载或手动清理。",
+                    "原路径 {} 已是真实目录（保留模式还原后的数据）。\n\n\
+                     要再次从目标副本恢复，请先把该目录移走或改名，避免覆盖其中可能的新数据。\n\n\
+                     目标副本仍保留在：{}",
+                    record.original_path, record.target_path
+                ),
+                new_path: None,
+            });
+        }
+
+        if crate::storage::history::is_empty_directory(&target_path)? && !force_empty_continue {
+            return Ok(MigrationResult {
+                success: false,
+                message: format!(
+                    "{}{}",
+                    crate::storage::history::TARGET_EMPTY_CONFIRM_PREFIX,
                     target_path.display()
                 ),
                 new_path: None,
             });
         }
 
-        // 进程占用检测
-        {
+        // 进程占用检测（仅链接模式只动链接本身，不需要关闭程序）
+        if mode != crate::models::RestoreMode::LinkOnly {
             let mut sys = sysinfo::System::new_all();
             sys.refresh_all();
             let original_lower = record.original_path.to_lowercase();
@@ -525,32 +579,44 @@ pub fn restore_large_folder_by_history(
             &app_handle,
             // 同上：大文件夹恢复不补沙箱读取权限
             false,
+            mode,
         )?;
 
-        // 按 ID 更新 history 记录状态
-        if let Err(e) = crate::storage::history::update_record_status_by_id(&history_id, "restored") {
-            eprintln!("警告: 更新大文件夹恢复记录状态失败: {}", e);
+        // 按 ID 更新 history 记录状态；仅链接模式不改迁移关系，记录保持 active
+        if !restore_result.action.is_link_only() {
+            if let Err(e) = crate::storage::history::update_record_status_by_id(
+                &history_id,
+                "restored",
+                restore_result.target_kept,
+            ) {
+                log_warn!("folder_manager", "更新大文件夹恢复记录状态失败: {}", e);
+            }
         }
 
-        let mut message = format!(
-            "恢复成功！文件夹已从 {} 移回 {}（{}）",
-            record.target_path,
-            record.original_path,
-            crate::migration::format_bytes(restore_result.restored_size)
+        let message = crate::migration::build_restore_message(
+            &format!("文件夹 {}", record.app_name),
+            &record.original_path,
+            &record.target_path,
+            mode,
+            restore_result.action,
+            restore_result.restored_size,
+            restore_result.cleanup_warning.as_deref(),
         );
-        if let Some(warning) = restore_result.cleanup_warning {
-            message.push_str(&format!("\n\n{}", warning));
-        }
 
         Ok(MigrationResult {
             success: true,
             message,
-            new_path: Some(record.original_path),
+            new_path: if restore_result.action.is_link_only() {
+                None
+            } else {
+                Some(record.original_path.clone())
+            },
         })
     }
 
     #[cfg(not(windows))]
     {
+        let _ = (&history_id, &record, &app_handle, force_empty_continue);
         Ok(MigrationResult {
             success: false,
             message: "恢复功能仅支持 Windows 系统".to_string(),
