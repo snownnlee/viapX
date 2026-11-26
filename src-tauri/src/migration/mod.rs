@@ -61,7 +61,7 @@ use links::{
     create_directory_link, create_migration_backup_path, preflight_directory_link,
     restore_source_from_backup, verify_directory_link,
 };
-use occupancy::check_file_locks;
+use occupancy::{check_file_locks, LockCheckOutcome, LockReport};
 
 /// 迁移进度事件（发送到前端）
 #[derive(Clone, Serialize)]
@@ -226,6 +226,63 @@ fn migration_success_message(
     msg
 }
 
+/// 预检命中文件占用/权限受限时返回的协议前缀
+const LOCK_WARN_PREFIX: &str = "LOCK_WARN:";
+/// 协议载荷里每类最多携带的路径条数（UI 只需展示样本，全量看检测日志）
+const LOCK_HINT_LIMIT: usize = 20;
+
+/// 构造「可继续」协议消息
+///
+/// 前端解析后分类展示并弹确认，用户选择继续时带 `force_lock_continue` 重试。
+/// 占用与权限受限的处置方式完全不同，必须分类返回，不能混成一个列表。
+fn lock_warning_message(source: &str, report: &LockReport) -> String {
+    #[derive(Serialize)]
+    struct LockWarning<'a> {
+        source: &'a str,
+        denied: Vec<&'a str>,
+        busy: Vec<&'a str>,
+        rebuildable: u64,
+        blocking_total: u64,
+    }
+
+    let (denied, busy) = report.split();
+    let payload = LockWarning {
+        source,
+        denied: denied
+            .iter()
+            .take(LOCK_HINT_LIMIT)
+            .map(|file| file.path.as_str())
+            .collect(),
+        busy: busy
+            .iter()
+            .filter(|file| file.blocks_migration())
+            .take(LOCK_HINT_LIMIT)
+            .map(|file| file.path.as_str())
+            .collect(),
+        rebuildable: report.rebuildable,
+        blocking_total: report.blocking_count(),
+    };
+    match serde_json::to_string(&payload) {
+        Ok(json) => format!("{LOCK_WARN_PREFIX}{json}"),
+        // 序列化失败退回纯文本，至少不把裸协议交给用户
+        Err(_) => format!(
+            "目录中有文件无法独占打开，已停止迁移。\n\n权限受限 {} 个，被其他程序占用 {} 个（其中 {} 个位于可重建目录）。",
+            report.denied, report.busy, report.rebuildable
+        ),
+    }
+}
+
+/// 迁移前的用户确认开关：三项都由前端负责弹窗取得，后端只按开关放行
+#[derive(Clone, Copy, Default)]
+pub struct MigrationConfirm {
+    /// 允许清理已存在的目标残留目录
+    pub force_overwrite: bool,
+    /// 已确认高风险路径警告
+    pub user_confirmed_warning: bool,
+    /// 已确认文件占用 / 权限受限的预检结果
+    pub force_lock_continue: bool,
+}
+
 /// 核心迁移命令
 /// 将应用从源路径迁移到目标路径，并创建目录链接（同卷 Junction / 跨卷软链接）
 pub fn migrate_app(
@@ -235,11 +292,15 @@ pub fn migrate_app(
     cancel_flag: &Arc<AtomicBool>,
     app_handle: &tauri::AppHandle,
     record_type: MigrationRecordType,
-    force_overwrite: bool,
-    user_confirmed_warning: bool,
+    confirm: MigrationConfirm,
 ) -> Result<MigrationResult, String> {
     #[cfg(windows)]
     {
+        let MigrationConfirm {
+            force_overwrite,
+            user_confirmed_warning,
+            force_lock_continue,
+        } = confirm;
         let source_path = Path::new(&source);
         let target_parent_path = Path::new(&target_parent);
 
@@ -485,40 +546,46 @@ pub fn migrate_app(
         // （rename 被占用阻塞时会由 rename 自身报错，提示同样明确）。
         // 跨盘复制才需要提前发现"复制到一半才失败"的情况。
         let cross_drive_copy = !same_drive;
-        let locked_files = if cross_drive_copy
+        let lock_report = if cross_drive_copy
             && !crate::storage::user_settings::load_current_settings().skip_lock_check
         {
-            check_file_locks(&copy_plan, cancel_flag, &reporter)
+            match check_file_locks(&copy_plan, cancel_flag, &reporter) {
+                // 取消必须与"有占用"区分开，否则会把用户取消误报成占用
+                LockCheckOutcome::Cancelled => return Err("用户取消了迁移".to_string()),
+                LockCheckOutcome::Report(report) => report,
+            }
         } else {
-            Vec::new()
+            LockReport::default()
         };
-        // 锁探测被取消时其返回值为占位"检测已取消"，此处优先按取消处理，
-        // 避免把取消误报成"文件被占用"
+        // 探测期间用户可能点了取消，进入后续步骤前再确认一次
         if cancel_flag.load(Ordering::Relaxed) {
             return Err("用户取消了迁移".to_string());
         }
-        if !locked_files.is_empty() {
-            // 含 exe 时占用源多为被加载的 DLL，提示注销/重启；否则提示关闭程序
-            let hint = if has_exe_in_source {
-                "被占用的文件通常是 .dll 等被资源管理器或系统服务加载的组件，\n\
-                 请注销当前用户或重启系统后重试。"
-            } else {
-                "请关闭正在使用这些文件的程序（如浏览器、游戏、编辑器等）后重试。"
-            };
-            return Ok(MigrationResult {
-                success: false,
-                message: format!(
-                    "目录中有文件正被其他程序占用，无法迁移。\n\n\
-                     被占用的文件：\n{}\n\n{}",
-                    locked_files
-                        .iter()
-                        .map(|f| format!("  • {}", f))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    hint
-                ),
-                new_path: None,
-            });
+        let lock_blocking = lock_report.blocking_count();
+        if lock_blocking > 0 {
+            // 只报可忽略项的检测结果不算阻塞，但不可忽略项必须由用户明确同意才能继续
+            if !force_lock_continue {
+                return Ok(MigrationResult {
+                    success: false,
+                    message: lock_warning_message(&source, &lock_report),
+                    new_path: None,
+                });
+            }
+            log_warn!(
+                "migration",
+                "预检命中 {} 项（权限受限 {} / 被占用 {}），用户选择继续: {}",
+                lock_blocking,
+                lock_report.denied,
+                lock_report.busy,
+                source
+            );
+        } else if lock_report.rebuildable > 0 {
+            log_warn!(
+                "migration",
+                "可重建目录内有 {} 个文件被占用，按可忽略处理: {}",
+                lock_report.rebuildable,
+                source
+            );
         }
 
         // 步骤 0.5.1：及时响应取消（sysinfo 刷新可能较慢）

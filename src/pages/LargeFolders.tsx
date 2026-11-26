@@ -20,7 +20,12 @@ import { useDangerousPathCheck, WarningInfo } from '../hooks/useDangerousPathChe
 import WarningConfirmDialog from '../components/WarningConfirmDialog';
 import BatchMigrationReport from '../components/BatchMigrationReport';
 import { useViapStore } from '../store';
-import { formatMigrationFailureMessage, parseTargetExistsConflict } from '../utils/migrationMessages';
+import {
+  buildLockWarningPrompt,
+  formatMigrationFailureMessage,
+  parseLockWarning,
+  parseTargetExistsConflict,
+} from '../utils/migrationMessages';
 import {
   buildBatchConfirmMessage, getAvailableSpaceForPath, type BatchReportItem,
 } from '../utils/batchMigration';
@@ -663,6 +668,31 @@ export default function LargeFolders({ visible }: { visible: boolean }) {
         });
       }
 
+      // 文件占用/权限预检命中：分类弹窗说明处置方式，用户确认后带 forceLockContinue 重试
+      if (!result.success) {
+        const lockWarning = parseLockWarning(result.message);
+        if (lockWarning) {
+          const proceed = await confirm(buildLockWarningPrompt(lockWarning), {
+            title: '文件占用与权限检测',
+            kind: 'warning',
+            okLabel: '忽略并继续',
+            cancelLabel: '取消',
+          });
+          if (!proceed) {
+            setMigrationStep('error');
+            setMigrationMessage('用户取消了迁移（检测到文件被占用或权限受限）');
+            return;
+          }
+          result = await invoke<MigrationResult>('migrate_large_folder', {
+            sourcePath: folder.path,
+            targetDir,
+            forceOverwrite: true,
+            userConfirmedWarning,
+            forceLockContinue: true,
+          });
+        }
+      }
+
       if (result.success) {
         setMigrationStep('success');
         setMigrationProgress(100);
@@ -865,6 +895,19 @@ export default function LargeFolders({ visible }: { visible: boolean }) {
           continue;
         }
 
+        // 文件占用/权限预检命中：批量不逐个弹窗确认，按跳过处理并列明原因
+        if (!result.success) {
+          const batchLockWarning = parseLockWarning(result.message);
+          if (batchLockWarning) {
+            results.push({
+              name: folder.display_name,
+              status: 'skipped',
+              reason: `有 ${batchLockWarning.blockingTotal} 个文件被占用或权限受限，已跳过（单独迁移时可选择继续）`,
+            });
+            continue;
+          }
+        }
+
         // 处理 TARGET_EXISTS 特殊返回值（不能直接 Toast 路径字符串给用户）
         const targetConflict = parseTargetExistsConflict(result.message);
         if (!result.success && targetConflict) {
@@ -891,6 +934,12 @@ export default function LargeFolders({ visible }: { visible: boolean }) {
             });
             if (retryResult.success) {
               results.push({ name: folder.display_name, status: 'success' });
+            } else if (parseLockWarning(retryResult.message)) {
+              results.push({
+                name: folder.display_name,
+                status: 'skipped',
+                reason: '有文件被占用或权限受限，已跳过',
+              });
             } else {
               results.push({
                 name: folder.display_name,

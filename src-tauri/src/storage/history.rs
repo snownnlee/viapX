@@ -589,12 +589,14 @@ pub fn clean_ghost_links() -> Result<CleanupResult, String> {
 pub async fn remigrate_ghost_link(
     history_id: String,
     force_overwrite: Option<bool>,
+    force_lock_continue: Option<bool>,
     state: tauri::State<'_, MigrationState>,
     app_handle: tauri::AppHandle,
 ) -> Result<MigrationResult, String> {
     use std::sync::atomic::Ordering;
 
     let force = force_overwrite.unwrap_or(false);
+    let lock_continue = force_lock_continue.unwrap_or(false);
 
     let record = load_history()
         .records
@@ -648,7 +650,13 @@ pub async fn remigrate_ghost_link(
     let record_type = record.record_type;
 
     // 复用迁移引擎：force_overwrite 覆盖目标残留（空目录或用户已确认的目录）；
-    // user_confirmed_warning=true 因为同一路径迁移时已确认过危险等级
+    // user_confirmed_warning=true 因为同一路径迁移时已确认过危险等级；
+    // 文件占用仍需用户在弹窗里单独确认，不能替用户跳过
+    let confirm = crate::migration::MigrationConfirm {
+        force_overwrite: true,
+        user_confirmed_warning: true,
+        force_lock_continue: lock_continue,
+    };
     let result = tauri::async_runtime::spawn_blocking(move || {
         crate::migration::migrate_app(
             app_name,
@@ -657,8 +665,7 @@ pub async fn remigrate_ghost_link(
             &cancel_flag,
             &app_handle,
             record_type,
-            true,
-            true,
+            confirm,
         )
     })
     .await

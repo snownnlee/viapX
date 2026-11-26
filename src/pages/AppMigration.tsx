@@ -14,7 +14,12 @@ import BatchMigrationReport from '../components/BatchMigrationReport';
 import TargetPickerDialog from '../components/TargetPickerDialog';
 import Toast, { useToast } from '../components/Toast';
 import { logger } from '../utils/logger';
-import { formatMigrationFailureMessage, parseTargetExistsConflict } from '../utils/migrationMessages';
+import {
+  buildLockWarningPrompt,
+  formatMigrationFailureMessage,
+  parseLockWarning,
+  parseTargetExistsConflict,
+} from '../utils/migrationMessages';
 import {
   buildBatchConfirmMessage, getAvailableSpaceForPath, type BatchReportItem,
 } from '../utils/batchMigration';
@@ -1352,6 +1357,35 @@ export default function AppMigration({ visible }: { visible: boolean }) {
         return;
       }
 
+      // 后端文件占用/权限预检（跨盘复制才做）：命中时按分类弹窗说明处置方式，
+      // 用户确认后带 forceLockContinue 重试；不确认则停止，不替用户做取舍。
+      if (!result.success) {
+        const lockWarning = parseLockWarning(result.message);
+        if (lockWarning) {
+          const proceed = await confirm(buildLockWarningPrompt(lockWarning), {
+            title: '文件占用与权限检测',
+            kind: 'warning',
+            okLabel: '忽略并继续',
+            cancelLabel: '取消',
+          });
+          if (!proceed) {
+            if (unlisten) unlisten();
+            setMigrationStep('error');
+            setMigrationMessage('用户取消了迁移（检测到文件被占用或权限受限）');
+            return;
+          }
+          result = await invoke<MigrationResult>('migrate_app', {
+            appName: app.display_name,
+            source: app.install_location,
+            targetParent: targetDir,
+            // 目标残留此前已由用户确认覆盖，重试时保持同一决定
+            forceOverwrite: true,
+            userConfirmedWarning,
+            forceLockContinue: true,
+          });
+        }
+      }
+
       // 取消事件监听
       if (unlisten) unlisten();
 
@@ -1621,6 +1655,17 @@ export default function AppMigration({ visible }: { visible: boolean }) {
           continue;
         }
 
+        // 文件占用/权限预检命中：批量模式不逐个弹窗确认，按跳过处理并列明原因
+        const batchLockWarning = parseLockWarning(result.message);
+        if (!result.success && batchLockWarning) {
+          results.push({
+            name: app.display_name,
+            status: 'skipped',
+            reason: `有 ${batchLockWarning.blockingTotal} 个文件被占用或权限受限，已跳过（单独迁移时可选择继续）`,
+          });
+          continue;
+        }
+
         // 目标路径已有残留目录 → 弹出确认框，用户确认后以 force_overwrite 重试
         const targetConflict = parseTargetExistsConflict(result.message);
         if (!result.success && targetConflict) {
@@ -1653,6 +1698,16 @@ export default function AppMigration({ visible }: { visible: boolean }) {
             });
             continue;
           }
+        }
+
+        // 覆盖重试可能再次命中文件占用/权限预检：批量按跳过处理
+        if (!result.success && parseLockWarning(result.message)) {
+          results.push({
+            name: app.display_name,
+            status: 'skipped',
+            reason: '有文件被占用或权限受限，已跳过（单独迁移时可选择继续）',
+          });
+          continue;
         }
 
         // Junction 循环检测：原路径仍是 Junction 指向目标盘

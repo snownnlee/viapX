@@ -153,6 +153,10 @@ fn check_process_locks(source_path: String) -> Result<ProcessLockResult, String>
 
 /// 将阻塞型 IO（目录遍历、文件复制、联接创建）移至专用线程池
 /// 主 IPC 线程保持空闲以处理进度事件和取消请求，消除 UI 假死
+///
+/// 确认开关保持扁平参数：Tauri 命令的参数名即 IPC 字段名，改成结构体会连带改变
+/// 前端所有调用点的载荷形状，收益不抵风险。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn migrate_app(
     app_name: String,
@@ -160,19 +164,23 @@ async fn migrate_app(
     target_parent: String,
     force_overwrite: Option<bool>,
     user_confirmed_warning: Option<bool>,
+    force_lock_continue: Option<bool>,
     state: tauri::State<'_, MigrationState>,
     app_handle: tauri::AppHandle,
 ) -> Result<MigrationResult, String> {
     state.cancel_flag.store(false, Ordering::SeqCst);
     let source_clone = source.clone();
     let cancel_flag = state.cancel_flag.clone();
-    let force = force_overwrite.unwrap_or(false);
-    let confirmed = user_confirmed_warning.unwrap_or(false);
+    let confirm = migration::MigrationConfirm {
+        force_overwrite: force_overwrite.unwrap_or(false),
+        user_confirmed_warning: user_confirmed_warning.unwrap_or(false),
+        force_lock_continue: force_lock_continue.unwrap_or(false),
+    };
 
     let result = tauri::async_runtime::spawn_blocking(move || {
         migration::migrate_app(
             app_name, source, target_parent, &cancel_flag, &app_handle,
-            MigrationRecordType::App, force, confirmed,
+            MigrationRecordType::App, confirm,
         )
     }).await.map_err(|e| format!("迁移线程异常: {}", e))?;
 
@@ -197,10 +205,11 @@ async fn migrate_special_folder(
     state.cancel_flag.store(false, Ordering::SeqCst);
     let cancel_flag = state.cancel_flag.clone();
 
-    // force_overwrite=false：文件夹迁移不自动覆盖残留目录，保持保护逻辑
+    // 默认全不放行：不自动覆盖残留目录、不跳过高风险确认与占用预检
     tauri::async_runtime::spawn_blocking(move || {
         app_manager::detector::migrate_special_folder(
-            app_name, source_path, target_dir, &cancel_flag, &app_handle, false, false,
+            app_name, source_path, target_dir, &cancel_flag, &app_handle,
+            migration::MigrationConfirm::default(),
         )
     }).await.map_err(|e| format!("迁移线程异常: {}", e))?
 }

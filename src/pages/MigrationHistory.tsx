@@ -19,6 +19,11 @@ import ContextMenu from '../components/ContextMenu';
 import Checkbox from '../components/Checkbox';
 import Modal from '../components/Modal';
 import { useViapStore } from '../store';
+import {
+  buildLockWarningPrompt,
+  formatMigrationFailureMessage,
+  parseLockWarning,
+} from '../utils/migrationMessages';
 
 // no_data: 原路径已消失且目标为空/不存在，通常表示应用已被外部卸载。
 // broken_fixable: 链接失效但可修复——原路径存在真实目录（应用更新重建）或目标仍有数据，可重新迁移/恢复
@@ -531,12 +536,31 @@ export default function MigrationHistory({ visible: _visible }: { visible: boole
         result = await invoke<MigrationResult>('remigrate_ghost_link', { historyId, forceOverwrite: true });
       }
 
+      // 文件占用/权限预检命中：分类弹窗说明处置方式，用户确认后带 forceLockContinue 重试
+      if (!result.success) {
+        const lockWarning = parseLockWarning(result.message);
+        if (lockWarning) {
+          const proceed = await confirm(buildLockWarningPrompt(lockWarning), {
+            title: '文件占用与权限检测',
+            kind: 'warning',
+            okLabel: '忽略并继续',
+            cancelLabel: '取消',
+          });
+          if (!proceed) return;
+          result = await invoke<MigrationResult>('remigrate_ghost_link', {
+            historyId,
+            forceOverwrite: true,
+            forceLockContinue: true,
+          });
+        }
+      }
+
       if (result.success) {
         showToast(result.message, 'success');
         setCachedStatus(historyId, 'unknown' as LinkStatus);
         await loadHistory();
       } else {
-        showToast(result.message || '重新迁移失败', 'error');
+        showToast(formatMigrationFailureMessage(result.message) || '重新迁移失败', 'error');
       }
     } catch (error) {
       showToast(`重新迁移失败: ${error}`, 'error');
